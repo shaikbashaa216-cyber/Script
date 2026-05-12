@@ -1,0 +1,1726 @@
+<# 
+.SYNOPSIS
+    Full Active Directory forest health check with optimized performance for large environments.
+
+.DESCRIPTION
+    Scans every domain controller discovered in the current AD forest, tests connectivity,
+    and collects forest, domain, FSMO, replication, DNS, site, GPO, time, service, SYSVOL,
+    NETLOGON health data. Results are cached locally and output to a single HTML file.
+
+    Optimized for environments with 200+ domain controllers by:
+    - Caching results to avoid repeated queries
+    - Parallel port scanning with throttling
+    - Optional skipping of time-consuming checks
+    - Progress reporting
+    
+.NOTES
+    Run from a domain joined server with an account that can read AD and query DCs.
+    Best results with ActiveDirectory PowerShell module.
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $false)]
+    [string]$OutputPath,
+
+    [Parameter(Mandatory = $false)]
+    [string]$CachePath = "$env:TEMP\ADHealthCheck_Cache",
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipDcDiag,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipDnsTests,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipGpoTests,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipReplicationTests,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipServiceChecks,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipPatchChecks,
+
+    [Parameter(Mandatory = $false)]
+    [int]$TcpTimeoutMs = 3000,
+
+    [Parameter(Mandatory = $false)]
+    [int]$MaxParallelPortChecks = 10,
+
+    [Parameter(Mandatory = $false)]
+    [int]$CacheHours = 24,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ForceRefresh,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$OpenReport
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Continue'
+$scriptVersion = '3.0.0'
+
+#region Helper Functions
+function Write-ProgressStep {
+    param(
+        [string]$Activity,
+        [string]$Status,
+        [int]$PercentComplete = -1
+    )
+    Write-Progress -Activity $Activity -Status $Status -PercentComplete $PercentComplete -CurrentOperation $Status
+}
+
+function New-Result {
+    param(
+        [string]$Area,
+        [string]$Target,
+        [string]$Name,
+        [ValidateSet('Pass', 'Warn', 'Fail', 'Info', 'Skipped')]
+        [string]$Status,
+        [string]$Message,
+        [object]$Data = $null
+    )
+
+    [pscustomobject]@{
+        Area      = $Area
+        Target    = $Target
+        Name      = $Name
+        Status    = $Status
+        Message   = $Message
+        Data      = $Data
+        Timestamp = (Get-Date).ToString('s')
+    }
+}
+
+function Get-StatusRank {
+    param([string]$Status)
+    switch ($Status) {
+        'Fail'    { 4 }
+        'Warn'    { 3 }
+        'Skipped' { 2 }
+        'Info'    { 1 }
+        'Pass'    { 0 }
+        default   { 1 }
+    }
+}
+
+function Join-Status {
+    param([object[]]$Items)
+    if (-not $Items -or $Items.Count -eq 0) { return 'Info' }
+    $highest = 'Pass'
+    foreach ($item in $Items) {
+        if ((Get-StatusRank $item.Status) -gt (Get-StatusRank $highest)) {
+            $highest = $item.Status
+        }
+    }
+    return $highest
+}
+
+function Test-CommandExists {
+    param([string]$Name)
+    return [bool](Get-Command -Name $Name -ErrorAction SilentlyContinue)
+}
+
+function Import-ModuleIfAvailable {
+    param([string]$Name)
+    try {
+        Import-Module $Name -ErrorAction Stop
+        return New-Result -Area 'Prerequisite' -Target $env:COMPUTERNAME -Name "Module $Name" -Status 'Pass' -Message "PowerShell module '$Name' loaded."
+    }
+    catch {
+        return New-Result -Area 'Prerequisite' -Target $env:COMPUTERNAME -Name "Module $Name" -Status 'Warn' -Message "PowerShell module '$Name' is not available or failed to load. $($_.Exception.Message)"
+    }
+}
+
+function Invoke-NativeCommand {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments
+    )
+    $output = New-Object System.Collections.Generic.List[string]
+    $exitCode = $null
+    try {
+        $oldPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $cmdOutput = & $FilePath @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $oldPreference
+        if ($cmdOutput) {
+            foreach ($line in $cmdOutput) {
+                $output.Add([string]$line)
+            }
+        }
+    }
+    catch {
+        $output.Add($_.Exception.Message)
+        $exitCode = 9999
+    }
+    [pscustomobject]@{
+        ExitCode = $exitCode
+        Output   = ($output -join [Environment]::NewLine)
+        Lines    = @($output)
+    }
+}
+
+function Test-TcpPort {
+    param(
+        [string]$ComputerName,
+        [int]$Port,
+        [int]$TimeoutMs = 3000
+    )
+    $client = New-Object System.Net.Sockets.TcpClient
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $async = $client.BeginConnect($ComputerName, $Port, $null, $null)
+        $success = $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
+        $watch.Stop()
+        if (-not $success) {
+            $client.Close()
+            return [pscustomobject]@{ Open = $false; LatencyMs = $null; Message = "Timed out after $TimeoutMs ms" }
+        }
+        $client.EndConnect($async)
+        $client.Close()
+        return [pscustomobject]@{ Open = $true; LatencyMs = [int]$watch.ElapsedMilliseconds; Message = 'Connected' }
+    }
+    catch {
+        $watch.Stop()
+        try { $client.Close() } catch {}
+        return [pscustomobject]@{ Open = $false; LatencyMs = $null; Message = $_.Exception.Message }
+    }
+}
+
+function Test-TcpPortsParallel {
+    param(
+        [string]$ComputerName,
+        [array]$Ports,
+        [int]$TimeoutMs = 3000,
+        [int]$MaxParallel = 10
+    )
+    $results = [System.Collections.Concurrent.ConcurrentBag[pscustomobject]]::new()
+    $semaphore = [System.Threading.SemaphoreSlim]::new($MaxParallel)
+    $tasks = @()
+
+    foreach ($port in $Ports) {
+        $tasks.Add([System.Threading.Tasks.Task]::Run({
+            param($p)
+            $semaphore.Wait()
+            try {
+                $result = Test-TcpPort -ComputerName $ComputerName -Port $p -TimeoutMs $TimeoutMs
+                $results.Add([pscustomobject]@{
+                    Port = $p
+                    Open = $result.Open
+                    LatencyMs = $result.LatencyMs
+                    Message = $result.Message
+                })
+            }
+            finally {
+                $semaphore.Release()
+            }
+        }, $port))
+    }
+    [System.Threading.Tasks.Task]::WaitAll($tasks)
+    return $results
+}
+
+function Save-Cache {
+    param(
+        [string]$CacheKey,
+        [object]$Data
+    )
+    try {
+        if (-not (Test-Path $CachePath)) {
+            New-Item -Path $CachePath -ItemType Directory -Force | Out-Null
+        }
+        $cacheFile = Join-Path $CachePath "$CacheKey.json"
+        $cacheObj = @{
+            Timestamp = (Get-Date)
+            Data = $Data
+            Version = $scriptVersion
+        }
+        $cacheObj | ConvertTo-Json -Depth 10 | Set-Content -Path $cacheFile -Encoding UTF8
+    }
+    catch {
+        Write-Verbose "Failed to save cache for $CacheKey : $($_.Exception.Message)"
+    }
+}
+
+function Load-Cache {
+    param(
+        [string]$CacheKey,
+        [int]$MaxAgeHours = 24
+    )
+    try {
+        $cacheFile = Join-Path $CachePath "$CacheKey.json"
+        if (-not (Test-Path $cacheFile)) { return $null }
+        $cacheObj = Get-Content -Path $cacheFile -Raw | ConvertFrom-Json
+        $cacheAge = (Get-Date) - ([datetime]$cacheObj.Timestamp)
+        if ($cacheAge.TotalHours -gt $MaxAgeHours) { return $null }
+        return $cacheObj.Data
+    }
+    catch {
+        return $null
+    }
+}
+#endregion
+
+#region Initialization
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "  Active Directory Forest Health Check" -ForegroundColor Cyan
+Write-Host "  Version $scriptVersion" -ForegroundColor Cyan
+Write-Host "========================================`n" -ForegroundColor Cyan
+
+$startedAt = Get-Date
+$prerequisites = New-Object System.Collections.Generic.List[object]
+$findings = New-Object System.Collections.Generic.List[object]
+$recommendations = New-Object System.Collections.Generic.List[object]
+$rawCommands = New-Object System.Collections.Generic.List[object]
+
+# Load modules
+$adModuleResult = Import-ModuleIfAvailable -Name 'ActiveDirectory'
+$prerequisites.Add($adModuleResult)
+$gpoModuleResult = Import-ModuleIfAvailable -Name 'GroupPolicy'
+$prerequisites.Add($gpoModuleResult)
+
+$dcdiagAvailable = Test-CommandExists -Name 'dcdiag.exe'
+$repadminAvailable = Test-CommandExists -Name 'repadmin.exe'
+$prerequisites.Add((New-Result -Area 'Prerequisite' -Target $env:COMPUTERNAME -Name 'dcdiag.exe' -Status ($(if ($dcdiagAvailable) { 'Pass' } else { 'Warn' })) -Message ($(if ($dcdiagAvailable) { 'dcdiag.exe found.' } else { 'dcdiag.exe was not found in PATH.' }))))
+$prerequisites.Add((New-Result -Area 'Prerequisite' -Target $env:COMPUTERNAME -Name 'repadmin.exe' -Status ($(if ($repadminAvailable) { 'Pass' } else { 'Warn' })) -Message ($(if ($repadminAvailable) { 'repadmin.exe found.' } else { 'repadmin.exe was not found in PATH.' }))))
+
+if ($adModuleResult.Status -ne 'Pass') {
+    Add-Recommendation -List $recommendations -Severity 'Critical' -Title 'ActiveDirectory module is required' -Details 'The script cannot discover forest or domain controllers without the ActiveDirectory PowerShell module.' -Action 'Install RSAT: Active Directory Domain Services and Lightweight Directory Tools, or run from a domain controller.'
+    Write-Host "ERROR: ActiveDirectory module is required. Exiting." -ForegroundColor Red
+    exit 1
+}
+
+# Create cache directory
+if (-not (Test-Path $CachePath)) {
+    New-Item -Path $CachePath -ItemType Directory -Force | Out-Null
+    Write-Host "Created cache directory: $CachePath" -ForegroundColor Gray
+}
+#endregion
+
+#region Discovery Phase
+Write-ProgressStep -Activity "AD Discovery" -Status "Discovering forest and domains..." -PercentComplete 0
+
+# Try to load from cache
+$forestInfo = $null
+$domains = $null
+$domainInfo = $null
+$domainControllers = $null
+$fsmoRoles = $null
+$sites = $null
+$siteLinks = $null
+$subnets = $null
+
+if (-not $ForceRefresh) {
+    Write-Host "Checking cache for forest information..." -ForegroundColor Gray
+    $forestInfo = Load-Cache -CacheKey "ForestInfo" -MaxAgeHours $CacheHours
+    $domains = Load-Cache -CacheKey "Domains" -MaxAgeHours $CacheHours
+    $domainInfo = Load-Cache -CacheKey "DomainInfo" -MaxAgeHours $CacheHours
+    $domainControllers = Load-Cache -CacheKey "DomainControllers" -MaxAgeHours $CacheHours
+    $fsmoRoles = Load-Cache -CacheKey "FSMORoles" -MaxAgeHours $CacheHours
+    $sites = Load-Cache -CacheKey "Sites" -MaxAgeHours $CacheHours
+    $siteLinks = Load-Cache -CacheKey "SiteLinks" -MaxAgeHours $CacheHours
+    $subnets = Load-Cache -CacheKey "Subnets" -MaxAgeHours $CacheHours
+}
+
+if ($null -eq $forestInfo) {
+    Write-Host "Discovering forest, domains, and domain controllers..." -ForegroundColor Cyan
+    Write-ProgressStep -Activity "AD Discovery" -Status "Querying forest information..." -PercentComplete 5
+    
+    try {
+        $forest = Get-ADForest -ErrorAction Stop
+        $forestInfo = [pscustomobject]@{
+            Name = $forest.Name
+            ForestMode = [string]$forest.ForestMode
+            RootDomain = $forest.RootDomain
+            SchemaMaster = $forest.SchemaMaster
+            DomainNamingRole = $forest.DomainNamingMaster
+            GlobalCatalogs = @($forest.GlobalCatalogs)
+            Sites = @($forest.Sites)
+            Domains = @($forest.Domains)
+        }
+        $domains = @($forest.Domains)
+        Save-Cache -CacheKey "ForestInfo" -Data $forestInfo
+        Save-Cache -CacheKey "Domains" -Data $domains
+    }
+    catch {
+        $findings.Add((New-Result -Area 'Discovery' -Target $env:USERDNSDOMAIN -Name 'Forest discovery' -Status 'Fail' -Message $_.Exception.Message))
+        Add-Recommendation -List $recommendations -Severity 'Critical' -Title 'Forest discovery failed' -Details $_.Exception.Message -Action 'Run from a domain joined server with RSAT AD tools and appropriate credentials.'
+        Write-Host "ERROR: Forest discovery failed. Exiting." -ForegroundColor Red
+        exit 1
+    }
+
+    # Collect FSMO roles
+    $fsmoRoles = @()
+    $fsmoRoles += [pscustomobject]@{ Scope = 'Forest'; Role = 'Schema Master'; Holder = $forest.SchemaMaster }
+    $fsmoRoles += [pscustomobject]@{ Scope = 'Forest'; Role = 'Domain Naming Master'; Holder = $forest.DomainNamingMaster }
+
+    # Collect domain information
+    $domainInfo = @()
+    $totalDomains = $domains.Count
+    $domainIndex = 0
+    foreach ($domainName in $domains) {
+        $domainIndex++
+        Write-ProgressStep -Activity "AD Discovery" -Status "Processing domain: $domainName" -PercentComplete (5 + ($domainIndex / $totalDomains * 30))
+        try {
+            $domain = Get-ADDomain -Server $domainName -ErrorAction Stop
+            $domainInfo += [pscustomobject]@{
+                Name = $domain.DNSRoot
+                NetBIOSName = $domain.NetBIOSName
+                DomainMode = [string]$domain.DomainMode
+                PDCEmulator = $domain.PDCEmulator
+                RIDMaster = $domain.RIDMaster
+                InfrastructureMaster = $domain.InfrastructureMaster
+                UsersContainer = $domain.UsersContainer
+                ComputersContainer = $domain.ComputersContainer
+                DeletedObjects = $domain.DeletedObjectsContainer
+            }
+            $fsmoRoles += [pscustomobject]@{ Scope = $domain.DNSRoot; Role = 'PDC Emulator'; Holder = $domain.PDCEmulator }
+            $fsmoRoles += [pscustomobject]@{ Scope = $domain.DNSRoot; Role = 'RID Master'; Holder = $domain.RIDMaster }
+            $fsmoRoles += [pscustomobject]@{ Scope = $domain.DNSRoot; Role = 'Infrastructure Master'; Holder = $domain.InfrastructureMaster }
+            
+            # Get domain controllers for this domain
+            $dcs = Get-ADDomainController -Filter * -Server $domainName -ErrorAction Stop
+            foreach ($dc in $dcs) {
+                $domainControllers += [pscustomobject]@{
+                    Name = $dc.Name
+                    HostName = $dc.HostName
+                    Domain = $domainName
+                    Site = $dc.Site
+                    IPv4Address = $dc.IPv4Address
+                    IPv6Address = $dc.IPv6Address
+                    OperatingSystem = $dc.OperatingSystem
+                    OperatingSystemHotfix = $dc.OperatingSystemHotfix
+                    IsGlobalCatalog = $dc.IsGlobalCatalog
+                    IsReadOnly = $dc.IsReadOnly
+                    Enabled = $dc.Enabled
+                    LdapPort = $dc.LdapPort
+                    SslPort = $dc.SslPort
+                    OperationMasterRoles = @($dc.OperationMasterRoles)
+                }
+            }
+        }
+        catch {
+            $findings.Add((New-Result -Area 'Discovery' -Target $domainName -Name 'Domain discovery' -Status 'Fail' -Message $_.Exception.Message))
+        }
+    }
+
+    $domainControllers = @($domainControllers | Sort-Object HostName -Unique)
+    Save-Cache -CacheKey "DomainInfo" -Data $domainInfo
+    Save-Cache -CacheKey "DomainControllers" -Data $domainControllers
+    Save-Cache -CacheKey "FSMORoles" -Data $fsmoRoles
+
+    # Collect sites
+    Write-ProgressStep -Activity "AD Discovery" -Status "Collecting site information..." -PercentComplete 40
+    try {
+        $sites = @(Get-ADReplicationSite -Filter * -Properties Description, Location, WhenCreated, WhenChanged -ErrorAction Stop | ForEach-Object {
+            $siteName = $_.Name
+            [pscustomobject]@{
+                Name = $_.Name
+                Description = $_.Description
+                Location = $_.Location
+                WhenCreated = $_.WhenCreated
+                WhenChanged = $_.WhenChanged
+                DcCount = @($domainControllers | Where-Object { $_.Site -eq $siteName }).Count
+            }
+        })
+        Save-Cache -CacheKey "Sites" -Data $sites
+    }
+    catch {
+        $findings.Add((New-Result -Area 'Sites' -Target $forest.Name -Name 'Site discovery' -Status 'Warn' -Message $_.Exception.Message))
+        $sites = @()
+    }
+
+    # Collect site links
+    try {
+        $siteLinks = @(Get-ADReplicationSiteLink -Filter * -Properties Cost, ReplicationFrequencyInMinutes, SitesIncluded, Options -ErrorAction Stop | ForEach-Object {
+            [pscustomobject]@{
+                Name = $_.Name
+                Cost = $_.Cost
+                ReplicationFrequencyInMinutes = $_.ReplicationFrequencyInMinutes
+                SitesIncluded = @($_.SitesIncluded)
+                Options = $_.Options
+            }
+        })
+        Save-Cache -CacheKey "SiteLinks" -Data $siteLinks
+    }
+    catch {
+        $findings.Add((New-Result -Area 'Sites' -Target $forest.Name -Name 'Site link discovery' -Status 'Warn' -Message $_.Exception.Message))
+        $siteLinks = @()
+    }
+
+    # Collect subnets
+    try {
+        $subnets = @(Get-ADReplicationSubnet -Filter * -Properties Site, Location, Description -ErrorAction Stop | ForEach-Object {
+            [pscustomobject]@{
+                Name = $_.Name
+                Site = if ($_.Site) { ($_.Site -split ',')[0] -replace '^CN=', '' } else { '' }
+                Location = $_.Location
+                Description = $_.Description
+            }
+        })
+        Save-Cache -CacheKey "Subnets" -Data $subnets
+    }
+    catch {
+        $findings.Add((New-Result -Area 'Sites' -Target $forest.Name -Name 'Subnet discovery' -Status 'Warn' -Message $_.Exception.Message))
+        $subnets = @()
+    }
+}
+else {
+    Write-Host "Loaded forest information from cache (age < $CacheHours hours)" -ForegroundColor Green
+    Write-Host "  - Domains: $($domains.Count)" -ForegroundColor Gray
+    Write-Host "  - Domain Controllers: $($domainControllers.Count)" -ForegroundColor Gray
+}
+
+Write-Host "`nDiscovered:" -ForegroundColor Cyan
+Write-Host "  - Forest: $($forestInfo.Name)" -ForegroundColor Gray
+Write-Host "  - Domains: $($domains.Count)" -ForegroundColor Gray
+Write-Host "  - Domain Controllers: $($domainControllers.Count)" -ForegroundColor Gray
+Write-Host "  - Sites: $($sites.Count)" -ForegroundColor Gray
+#endregion
+
+#region Port Definitions
+$portDefinitions = @(
+    [pscustomobject]@{ Port = 53; Protocol = 'TCP'; Required = 'Required'; Purpose = 'DNS queries' }
+    [pscustomobject]@{ Port = 88; Protocol = 'TCP'; Required = 'Required'; Purpose = 'Kerberos authentication' }
+    [pscustomobject]@{ Port = 135; Protocol = 'TCP'; Required = 'Required'; Purpose = 'RPC endpoint mapper' }
+    [pscustomobject]@{ Port = 389; Protocol = 'TCP'; Required = 'Required'; Purpose = 'LDAP directory queries' }
+    [pscustomobject]@{ Port = 445; Protocol = 'TCP'; Required = 'Required'; Purpose = 'SMB for SYSVOL/NETLOGON' }
+    [pscustomobject]@{ Port = 464; Protocol = 'TCP'; Required = 'Recommended'; Purpose = 'Kerberos password change' }
+    [pscustomobject]@{ Port = 636; Protocol = 'TCP'; Required = 'Recommended'; Purpose = 'LDAPS' }
+    [pscustomobject]@{ Port = 3268; Protocol = 'TCP'; Required = 'Required'; Purpose = 'Global Catalog LDAP' }
+    [pscustomobject]@{ Port = 3269; Protocol = 'TCP'; Required = 'Recommended'; Purpose = 'Global Catalog LDAPS' }
+    [pscustomobject]@{ Port = 9389; Protocol = 'TCP'; Required = 'Required'; Purpose = 'AD Web Services' }
+)
+
+$requiredPorts = @($portDefinitions | Where-Object { $_.Required -eq 'Required' } | ForEach-Object { $_.Port })
+#endregion
+
+#region Connectivity Tests
+$connectivity = New-Object System.Collections.Generic.List[object]
+$connectivitySummary = New-Object System.Collections.Generic.List[object]
+
+if ($domainControllers.Count -gt 0) {
+    Write-Host "`nTesting connectivity to domain controllers..." -ForegroundColor Cyan
+    $totalDcs = $domainControllers.Count
+    $dcIndex = 0
+    
+    foreach ($dc in $domainControllers) {
+        $dcIndex++
+        $target = $dc.HostName
+        Write-ProgressStep -Activity "Port Scanning" -Status "Testing $target ($dcIndex of $totalDcs)" -PercentComplete (($dcIndex / $totalDcs) * 100)
+        
+        $portResults = Test-TcpPortsParallel -ComputerName $target -Ports $requiredPorts -TimeoutMs $TcpTimeoutMs -MaxParallel $MaxParallelPortChecks
+        
+        $dcPortRows = New-Object System.Collections.Generic.List[object]
+        $blockedRequired = @()
+        
+        foreach ($portResult in $portResults) {
+            $portDef = $portDefinitions | Where-Object { $_.Port -eq $portResult.Port } | Select-Object -First 1
+            $status = if ($portResult.Open) { 'Pass' } else { 'Fail' }
+            if (-not $portResult.Open) { $blockedRequired += $portResult.Port }
+            
+            $row = [pscustomobject]@{
+                Target = $target
+                Domain = $dc.Domain
+                Site = $dc.Site
+                Port = $portResult.Port
+                Protocol = $portDef.Protocol
+                Required = $portDef.Required
+                Purpose = $portDef.Purpose
+                Status = $status
+                LatencyMs = $portResult.LatencyMs
+                Message = $portResult.Message
+            }
+            $dcPortRows.Add($row)
+            $connectivity.Add($row)
+        }
+        
+        $dcStatus = if ($blockedRequired.Count -gt 0) { 'Fail' } else { 'Pass' }
+        $openRequired = @($portResults | Where-Object { $_.Open }).Count
+        
+        $connectivitySummary.Add([pscustomobject]@{
+            Target = $target
+            Domain = $dc.Domain
+            Site = $dc.Site
+            Status = $dcStatus
+            RequiredPortsOpen = "$openRequired/$($requiredPorts.Count)"
+            BlockedRequiredPorts = $blockedRequired
+            RequiredFirewallGuidance = if ($blockedRequired.Count -gt 0) { "Open outbound from $env:COMPUTERNAME to $target on TCP ports: $($blockedRequired -join ', ')" } else { 'All required TCP ports are reachable.' }
+        })
+    }
+    Write-ProgressStep -Activity "Port Scanning" -Status "Complete" -PercentComplete 100 -Completed
+}
+#endregion
+
+#region DC Inventory (OS, Version, Patch)
+$dcInventory = New-Object System.Collections.Generic.List[object]
+
+if (-not $SkipPatchChecks -and $domainControllers.Count -gt 0) {
+    Write-Host "`nCollecting DC inventory (OS, version, patch status)..." -ForegroundColor Cyan
+    $totalDcs = $domainControllers.Count
+    $dcIndex = 0
+    
+    foreach ($dc in $domainControllers) {
+        $dcIndex++
+        $target = $dc.HostName
+        Write-ProgressStep -Activity "DC Inventory" -Status "Querying $target ($dcIndex of $totalDcs)" -PercentComplete (($dcIndex / $totalDcs) * 100)
+        
+        $os = $null
+        $computerSystem = $null
+        $bios = $null
+        $osStatus = 'Pass'
+        $message = 'Inventory collected.'
+        
+        # Try to load from cache first
+        $cacheKey = "DCInventory_$($target -replace '[^a-zA-Z0-9]', '_')"
+        $cachedInventory = if (-not $ForceRefresh) { Load-Cache -CacheKey $cacheKey -MaxAgeHours $CacheHours } else { $null }
+        
+        if ($cachedInventory) {
+            $dcInventory.Add($cachedInventory)
+            continue
+        }
+        
+        try {
+            $os = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $target -ErrorAction Stop
+        }
+        catch {
+            $osStatus = 'Warn'
+            $message = "Could not query Win32_OperatingSystem. $($_.Exception.Message)"
+        }
+        
+        try {
+            $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ComputerName $target -ErrorAction Stop
+        }
+        catch {}
+        
+        try {
+            $bios = Get-CimInstance -ClassName Win32_BIOS -ComputerName $target -ErrorAction Stop
+        }
+        catch {}
+        
+        $hotfixCount = $null
+        $latestHotfixId = ''
+        $latestHotfixDate = $null
+        $patchStatus = 'Info'
+        $patchMessage = ''
+        
+        try {
+            $hotfixes = @(Get-HotFix -ComputerName $target -ErrorAction Stop)
+            $hotfixCount = $hotfixes.Count
+            $datedHotfixes = @($hotfixes | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn -Descending)
+            if ($datedHotfixes.Count -gt 0) {
+                $latest = $datedHotfixes[0]
+                $latestHotfixId = $latest.HotFixID
+                $latestHotfixDate = $latest.InstalledOn
+                $patchAgeDays = [int]((Get-Date) - $latestHotfixDate).TotalDays
+                if ($patchAgeDays -le 45) {
+                    $patchStatus = 'Pass'
+                    $patchMessage = "Latest hotfix is $patchAgeDays day(s) old."
+                }
+                else {
+                    $patchStatus = 'Warn'
+                    $patchMessage = "Latest hotfix is $patchAgeDays day(s) old (threshold: 45 days)."
+                }
+            }
+            else {
+                $patchStatus = 'Warn'
+                $patchMessage = 'No hotfix install dates were returned.'
+            }
+        }
+        catch {
+            $patchStatus = 'Warn'
+            $patchMessage = "Could not query hotfixes. $($_.Exception.Message)"
+        }
+        
+        $lastBoot = if ($os) { Convert-ToDateTimeOrNull -Value $os.LastBootUpTime } else { $null }
+        $uptimeDays = if ($lastBoot) { [math]::Round(((Get-Date) - $lastBoot).TotalDays, 1) } else { $null }
+        
+        $inventoryItem = [pscustomobject]@{
+            Status = $osStatus
+            Target = $target
+            Name = $dc.Name
+            Domain = $dc.Domain
+            Site = $dc.Site
+            IsGlobalCatalog = $dc.IsGlobalCatalog
+            IsReadOnly = $dc.IsReadOnly
+            IPv4Address = $dc.IPv4Address
+            OperatingSystem = if ($os) { $os.Caption } else { $dc.OperatingSystem }
+            Version = if ($os) { $os.Version } else { '' }
+            BuildNumber = if ($os) { $os.BuildNumber } else { '' }
+            OSArchitecture = if ($os) { $os.OSArchitecture } else { '' }
+            LastBootUpTime = $lastBoot
+            UptimeDays = $uptimeDays
+            Manufacturer = if ($computerSystem) { $computerSystem.Manufacturer } else { '' }
+            Model = if ($computerSystem) { $computerSystem.Model } else { '' }
+            TotalMemoryGB = if ($computerSystem -and $computerSystem.TotalPhysicalMemory) { [math]::Round(($computerSystem.TotalPhysicalMemory / 1GB), 2) } else { $null }
+            BIOSSerialNumber = if ($bios) { $bios.SerialNumber } else { '' }
+            PatchStatus = $patchStatus
+            LatestHotFixID = $latestHotfixId
+            LatestHotFixDate = $latestHotfixDate
+            InstalledHotFixCount = $hotfixCount
+            PatchMessage = $patchMessage
+            Message = $message
+        }
+        $dcInventory.Add($inventoryItem)
+        Save-Cache -CacheKey $cacheKey -Data $inventoryItem
+    }
+    Write-ProgressStep -Activity "DC Inventory" -Status "Complete" -PercentComplete 100 -Completed
+}
+#endregion
+
+#region Service Health
+$serviceHealth = New-Object System.Collections.Generic.List[object]
+$shareHealth = New-Object System.Collections.Generic.List[object]
+
+if (-not $SkipServiceChecks -and $domainControllers.Count -gt 0) {
+    Write-Host "`nChecking service and share health..." -ForegroundColor Cyan
+    $serviceNames = @('NTDS', 'DNS', 'KDC', 'Netlogon', 'W32Time', 'DFSR', 'ADWS')
+    $totalDcs = $domainControllers.Count
+    $dcIndex = 0
+    
+    foreach ($dc in $domainControllers) {
+        $dcIndex++
+        $target = $dc.HostName
+        Write-ProgressStep -Activity "Service Health" -Status "Checking $target ($dcIndex of $totalDcs)" -PercentComplete (($dcIndex / $totalDcs) * 100)
+        
+        foreach ($serviceName in $serviceNames) {
+            try {
+                $svc = Get-Service -ComputerName $target -Name $serviceName -ErrorAction Stop
+                $status = if ($svc.Status -eq 'Running') { 'Pass' } else { 'Fail' }
+                $serviceHealth.Add([pscustomobject]@{
+                    Target = $target
+                    ServiceName = $serviceName
+                    DisplayName = $svc.DisplayName
+                    Status = $status
+                    State = [string]$svc.Status
+                    Message = if ($status -eq 'Pass') { 'Service is running.' } else { "Service state is $($svc.Status)." }
+                })
+            }
+            catch {
+                $status = if ($serviceName -eq 'DNS') { 'Warn' } else { 'Fail' }
+                $serviceHealth.Add([pscustomobject]@{
+                    Target = $target
+                    ServiceName = $serviceName
+                    DisplayName = $serviceName
+                    Status = $status
+                    State = 'Unknown'
+                    Message = $_.Exception.Message
+                })
+            }
+        }
+        
+        # Check SYSVOL and NETLOGON
+        foreach ($share in @('SYSVOL', 'NETLOGON')) {
+            $unc = "\\$target\$share"
+            try {
+                $exists = Test-Path -Path $unc -ErrorAction Stop
+                $shareHealth.Add([pscustomobject]@{
+                    Target = $target
+                    Share = $share
+                    Path = $unc
+                    Status = if ($exists) { 'Pass' } else { 'Fail' }
+                    Message = if ($exists) { "$share is reachable." } else { "$share is not reachable." }
+                })
+            }
+            catch {
+                $shareHealth.Add([pscustomobject]@{
+                    Target = $target
+                    Share = $share
+                    Path = $unc
+                    Status = 'Fail'
+                    Message = $_.Exception.Message
+                })
+            }
+        }
+    }
+    Write-ProgressStep -Activity "Service Health" -Status "Complete" -PercentComplete 100 -Completed
+}
+#endregion
+
+#region Replication Health
+$replicationHealth = New-Object System.Collections.Generic.List[object]
+
+if (-not $SkipReplicationTests -and $domainControllers.Count -gt 0 -and $repadminAvailable) {
+    Write-Host "`nCollecting replication health..." -ForegroundColor Cyan
+    
+    $repSummary = Invoke-NativeCommand -FilePath 'repadmin.exe' -Arguments @('/replsummary')
+    $rawCommands.Add([pscustomobject]@{
+        Name = 'repadmin /replsummary'
+        ExitCode = $repSummary.ExitCode
+        Output = $repSummary.Output
+    })
+    
+    # Parse replication summary
+    foreach ($line in $repSummary.Lines) {
+        if ($line -match '(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)') {
+            $replicationHealth.Add([pscustomobject]@{
+                Target = $Matches[1]
+                Fails = $Matches[2]
+                Errors = $Matches[3]
+                Status = if ([int]$Matches[2] -gt 0 -or [int]$Matches[3] -gt 0) { 'Fail' } else { 'Pass' }
+                Message = "DSA: $($Matches[1]) | Fails: $($Matches[2]) | Errors: $($Matches[3])"
+            })
+        }
+    }
+    
+    if ($replicationHealth.Count -eq 0) {
+        $replicationHealth.Add([pscustomobject]@{
+            Target = 'All'
+            Fails = 0
+            Errors = 0
+            Status = 'Pass'
+            Message = 'No replication failures reported by repadmin.'
+        })
+    }
+}
+elseif (-not $SkipReplicationTests -and -not $repadminAvailable) {
+    $replicationHealth.Add([pscustomobject]@{
+        Target = 'All'
+        Status = 'Skipped'
+        Message = 'repadmin.exe not available. Install RSAT AD DS tools.'
+    })
+}
+#endregion
+
+#region DNS Health
+$dnsHealth = New-Object System.Collections.Generic.List[object]
+$forestDnsName = $forestInfo.Name
+
+if (-not $SkipDnsTests -and $domainControllers.Count -gt 0) {
+    Write-Host "`nChecking DNS health..." -ForegroundColor Cyan    
+    $sampleSize = [math]::Min(10, $domainControllers.Count)
+    $totalDcs = $domainControllers.Count
+    $dcIndex = 0
+    
+    foreach ($dc in ($domainControllers | Select-Object -First $sampleSize)) {
+        $dcIndex++
+        $target = $dc.HostName
+        Write-ProgressStep -Activity "DNS Health" -Status "Checking $target ($dcIndex of $sampleSize)" -PercentComplete (($dcIndex / $sampleSize) * 100)
+        
+        if (Test-CommandExists -Name 'Resolve-DnsName') {
+            try {
+                $dcRecord = Resolve-DnsName -Name $target -Server $target -ErrorAction Stop
+                $dnsHealth.Add([pscustomobject]@{
+                    Target = $target
+                    Test = 'Resolve own host record'
+                    Status = 'Pass'
+                    Message = "Resolved $target using DNS server $target."
+                })
+            }
+            catch {
+                $dnsHealth.Add([pscustomobject]@{
+                    Target = $target
+                    Test = 'Resolve own host record'
+                    Status = 'Fail'
+                    Message = $_.Exception.Message
+                })
+            }
+            
+            if ($forestDnsName) {
+                $srvName = "_ldap._tcp.dc._msdcs.$forestDnsName"
+                try {
+                    $srvRecord = Resolve-DnsName -Name $srvName -Type SRV -Server $target -ErrorAction Stop
+                    $dnsHealth.Add([pscustomobject]@{
+                        Target = $target
+                        Test = 'Forest DC locator SRV'
+                        Status = 'Pass'
+                        Message = "Resolved $srvName successfully."
+                    })
+                }
+                catch {
+                    $dnsHealth.Add([pscustomobject]@{
+                        Target = $target
+                        Test = 'Forest DC locator SRV'
+                        Status = 'Fail'
+                        Message = $_.Exception.Message
+                    })
+                }
+            }
+        }
+        else {
+            $dnsHealth.Add([pscustomobject]@{
+                Target = $target
+                Test = 'Resolve-DnsName availability'
+                Status = 'Skipped'
+                Message = 'Resolve-DnsName cmdlet is not available.'
+            })
+        }
+    }
+    
+    if ($dcdiagAvailable) {
+        $dnsDiag = Invoke-NativeCommand -FilePath 'dcdiag.exe' -Arguments @('/test:dns', '/e', '/q')
+        $rawCommands.Add([pscustomobject]@{
+            Name = 'dcdiag /test:dns /e /q'
+            ExitCode = $dnsDiag.ExitCode
+            Output = $dnsDiag.Output
+        })
+        
+        $dnsHealth.Add([pscustomobject]@{
+            Target = 'Forest'
+            Test = 'DCDiag DNS enterprise test'
+            Status = if ($dnsDiag.ExitCode -eq 0 -and [string]::IsNullOrWhiteSpace($dnsDiag.Output)) { 'Pass' } elseif ($dnsDiag.Output -match 'failed|error') { 'Fail' } else { 'Warn' }
+            Message = if ([string]::IsNullOrWhiteSpace($dnsDiag.Output)) { 'DCDiag DNS quiet mode returned no issues.' } else { $dnsDiag.Output.Substring(0, [math]::Min(500, $dnsDiag.Output.Length)) }
+        })
+    }
+    Write-ProgressStep -Activity "DNS Health" -Status "Complete" -PercentComplete 100 -Completed
+}
+#endregion
+
+#region GPO Health
+$gpoHealth = New-Object System.Collections.Generic.List[object]
+
+if (-not $SkipGpoTests -and $gpoModuleResult.Status -eq 'Pass' -and $domains.Count -gt 0) {
+    Write-Host "`nCollecting GPO health (sampling first 5 domains)..." -ForegroundColor Cyan
+    
+    $sampleDomains = $domains | Select-Object -First 5
+    $totalDomains = $sampleDomains.Count
+    $domainIndex = 0
+    
+    foreach ($domainName in $sampleDomains) {
+        $domainIndex++
+        Write-ProgressStep -Activity "GPO Health" -Status "Processing domain: $domainName" -PercentComplete (($domainIndex / $totalDomains) * 100)
+        
+        try {
+            $gpos = @(Get-GPO -All -Domain $domainName -ErrorAction Stop)
+            foreach ($gpo in $gpos | Select-Object -First 20) {
+                $gpoHealth.Add([pscustomobject]@{
+                    Domain = $domainName
+                    Name = $gpo.DisplayName
+                    GpoStatus = [string]$gpo.GpoStatus
+                    Created = $gpo.CreationTime
+                    Modified = $gpo.ModificationTime
+                    Status = 'Info'
+                    Message = 'GPO information collected.'
+                })
+            }
+            if ($gpos.Count -gt 20) {
+                $gpoHealth.Add([pscustomobject]@{
+                    Domain = $domainName
+                    Name = "... and $($gpos.Count - 20) more GPOs"
+                    Status = 'Info'
+                    Message = "Total GPOs in domain: $($gpos.Count)"
+                })
+            }
+        }
+        catch {
+            $gpoHealth.Add([pscustomobject]@{
+                Domain = $domainName
+                Name = ''
+                Status = 'Warn'
+                Message = $_.Exception.Message
+            })
+        }
+    }
+    Write-ProgressStep -Activity "GPO Health" -Status "Complete" -PercentComplete 100 -Completed
+}
+elseif ($SkipGpoTests) {
+    $gpoHealth.Add([pscustomobject]@{ Domain = 'All'; Name = 'GPO health'; Status = 'Skipped'; Message = 'Skipped by parameter.' })
+}
+#endregion
+
+#region DCDiag
+$dcdiagHealth = New-Object System.Collections.Generic.List[object]
+
+if (-not $SkipDcDiag -and $dcdiagAvailable -and $domainControllers.Count -gt 0) {
+    Write-Host "`nRunning DCDiag (sampling first 5 DCs - this may take a while)..." -ForegroundColor Yellow
+    
+    $sampleDcs = $domainControllers | Select-Object -First 5
+    $totalDcs = $sampleDcs.Count
+    $dcIndex = 0
+    
+    foreach ($dc in $sampleDcs) {
+        $dcIndex++
+        $target = $dc.HostName
+        Write-ProgressStep -Activity "DCDiag" -Status "Running DCDiag on $target ($dcIndex of $totalDcs)" -PercentComplete (($dcIndex / $totalDcs) * 100)
+        
+        $diag = Invoke-NativeCommand -FilePath 'dcdiag.exe' -Arguments @("/s:$target", '/q')
+        $rawCommands.Add([pscustomobject]@{
+            Name = "dcdiag /s:$target /q"
+            ExitCode = $diag.ExitCode
+            Output = $diag.Output
+        })
+        
+        $hasFailure = $diag.Output -match 'failed test|fatal|error|failed'
+        $status = if ($diag.ExitCode -eq 0 -and -not $hasFailure -and [string]::IsNullOrWhiteSpace($diag.Output)) { 'Pass' } elseif ($hasFailure) { 'Fail' } else { 'Warn' }
+        
+        $dcdiagHealth.Add([pscustomobject]@{
+            Target = $target
+            Status = $status
+            ExitCode = $diag.ExitCode
+            Message = if ([string]::IsNullOrWhiteSpace($diag.Output)) { 'DCDiag quiet mode returned no issues.' } else { $diag.Output.Substring(0, [math]::Min(500, $diag.Output.Length)) + if ($diag.Output.Length -gt 500) { '... (truncated)' } else { '' } }
+        })
+    }
+    Write-ProgressStep -Activity "DCDiag" -Status "Complete" -PercentComplete 100 -Completed
+}
+elseif ($SkipDcDiag) {
+    $dcdiagHealth.Add([pscustomobject]@{ Target = 'All'; Status = 'Skipped'; Message = 'Skipped by parameter.' })
+}
+#endregion
+
+#region Time Health
+$timeHealth = New-Object System.Collections.Generic.List[object]
+
+if ($domainControllers.Count -gt 0) {
+    Write-Host "`nChecking time synchronization (sampling first 10 DCs)..." -ForegroundColor Cyan
+    
+    $sampleDcs = $domainControllers | Select-Object -First 10
+    $totalDcs = $sampleDcs.Count
+    $dcIndex = 0
+    
+    foreach ($dc in $sampleDcs) {
+        $dcIndex++
+        $target = $dc.HostName
+        Write-ProgressStep -Activity "Time Sync" -Status "Checking $target ($dcIndex of $totalDcs)" -PercentComplete (($dcIndex / $totalDcs) * 100)
+        
+        $timeResult = Invoke-NativeCommand -FilePath 'w32tm.exe' -Arguments @('/query', "/computer:$target", '/status')
+        $timeStatus = if ($timeResult.ExitCode -eq 0 -and $timeResult.Output -notmatch 'error|failed|denied') { 'Pass' } else { 'Warn' }
+        $source = ''
+        $stratum = ''
+        foreach ($line in $timeResult.Lines) {
+            if ($line -match '^Source:\s*(.+)$') { $source = $Matches[1].Trim() }
+            if ($line -match '^Stratum:\s*(.+)$') { $stratum = $Matches[1].Trim() }
+        }
+        $timeHealth.Add([pscustomobject]@{
+            Target = $target
+            Status = $timeStatus
+            Source = $source
+            Stratum = $stratum
+            Message = if ($timeStatus -eq 'Pass') { 'Time status OK.' } else { $timeResult.Output.Substring(0, [math]::Min(200, $timeResult.Output.Length)) }
+        })
+    }
+    Write-ProgressStep -Activity "Time Sync" -Status "Complete" -PercentComplete 100 -Completed
+}
+#endregion
+
+#region Results Assembly
+$allHealthRows = New-Object System.Collections.Generic.List[object]
+$allHealthRows.AddRange($prerequisites)
+$allHealthRows.AddRange($findings)
+$allHealthRows.AddRange(@($connectivitySummary | ForEach-Object { New-Result -Area 'Connectivity' -Target $_.Target -Name 'Required TCP port reachability' -Status $_.Status -Message $_.RequiredFirewallGuidance }))
+$allHealthRows.AddRange(@($dcInventory | ForEach-Object { New-Result -Area 'DC Inventory' -Target $_.Target -Name 'Server status' -Status $_.Status -Message "$($_.OperatingSystem) - $($_.PatchMessage)" }))
+$allHealthRows.AddRange(@($serviceHealth | ForEach-Object { New-Result -Area 'Services' -Target $_.Target -Name $_.ServiceName -Status $_.Status -Message $_.Message }))
+$allHealthRows.AddRange(@($shareHealth | ForEach-Object { New-Result -Area 'Shares' -Target $_.Target -Name $_.Share -Status $_.Status -Message $_.Message }))
+$allHealthRows.AddRange(@($replicationHealth | ForEach-Object { New-Result -Area 'Replication' -Target $_.Target -Name 'Replication status' -Status $_.Status -Message $_.Message }))
+$allHealthRows.AddRange(@($dnsHealth | ForEach-Object { New-Result -Area 'DNS' -Target $_.Target -Name $_.Test -Status $_.Status -Message $_.Message }))
+$allHealthRows.AddRange(@($gpoHealth | ForEach-Object { New-Result -Area 'GPO' -Target $_.Domain -Name $_.Name -Status $_.Status -Message $_.Message }))
+$allHealthRows.AddRange(@($dcdiagHealth | ForEach-Object { New-Result -Area 'DCDiag' -Target $_.Target -Name 'DCDiag' -Status $_.Status -Message $_.Message }))
+$allHealthRows.AddRange(@($timeHealth | ForEach-Object { New-Result -Area 'Time' -Target $_.Target -Name 'W32Time' -Status $_.Status -Message $_.Message }))
+
+$overallStatus = Join-Status -Items $allHealthRows
+$completedAt = Get-Date
+
+$summaryCards = @(
+    [pscustomobject]@{ Label = 'Overall status'; Value = $overallStatus; Status = $overallStatus; Detail = 'Worst status across all collected checks.' }
+    [pscustomobject]@{ Label = 'Forest'; Value = $forestInfo.Name; Status = 'Pass'; Detail = $forestInfo.ForestMode }
+    [pscustomobject]@{ Label = 'Domains'; Value = $domains.Count; Status = if ($domains.Count -gt 0) { 'Pass' } else { 'Fail' }; Detail = 'Domains discovered in the forest.' }
+    [pscustomobject]@{ Label = 'Domain controllers'; Value = $domainControllers.Count; Status = if ($domainControllers.Count -gt 0) { 'Pass' } else { 'Fail' }; Detail = 'DCs discovered across all domains.' }
+    [pscustomobject]@{ Label = 'Connectivity'; Value = @($connectivitySummary | Where-Object { $_.Status -eq 'Pass' }).Count; Status = (Join-Status -Items @($connectivitySummary)); Detail = 'DCs with required TCP ports reachable.' }
+    [pscustomobject]@{ Label = 'Replication'; Value = @($replicationHealth | Where-Object { $_.Status -eq 'Fail' }).Count; Status = (Join-Status -Items @($replicationHealth)); Detail = 'Replication failures reported.' }
+    [pscustomobject]@{ Label = 'DNS'; Value = @($dnsHealth | Where-Object { $_.Status -eq 'Fail' }).Count; Status = (Join-Status -Items @($dnsHealth)); Detail = 'DNS checks currently failing.' }
+    [pscustomobject]@{ Label = 'Services'; Value = @($serviceHealth | Where-Object { $_.Status -eq 'Fail' }).Count; Status = (Join-Status -Items @($serviceHealth)); Detail = 'Critical services not running.' }
+    [pscustomobject]@{ Label = 'Runtime'; Value = [math]::Round(($completedAt - $startedAt).TotalMinutes, 2); Status = 'Info'; Detail = 'Minutes used to collect this report.' }
+)
+
+$report = [ordered]@{
+    Metadata = [ordered]@{
+        GeneratedAt = $completedAt.ToString('yyyy-MM-dd HH:mm:ss')
+        StartedAt = $startedAt.ToString('yyyy-MM-dd HH:mm:ss')
+        RuntimeSeconds = [math]::Round(($completedAt - $startedAt).TotalSeconds, 2)
+        RunHost = $env:COMPUTERNAME
+        RunUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+        ScriptVersion = $scriptVersion
+        CacheUsed = if (-not $ForceRefresh) { 'Yes (age < ' + $CacheHours + ' hours)' } else { 'No (forced refresh)' }
+    }
+    OverallStatus = $overallStatus
+    SummaryCards = $summaryCards
+    Forest = $forestInfo
+    Domains = $domainInfo
+    DomainControllers = $domainControllers
+    DcInventory = $dcInventory
+    FSMORoles = $fsmoRoles
+    Prerequisites = $prerequisites
+    ConnectivitySummary = $connectivitySummary
+    ConnectivityDetails = $connectivity
+    PortDefinitions = $portDefinitions
+    Services = $serviceHealth
+    Shares = $shareHealth
+    TimeHealth = $timeHealth
+    ReplicationHealth = $replicationHealth
+    DnsHealth = $dnsHealth
+    Sites = $sites
+    SiteLinks = $siteLinks
+    Subnets = $subnets
+    GpoHealth = $gpoHealth
+    DcDiag = $dcdiagHealth
+    Recommendations = $recommendations
+    RawCommands = $rawCommands
+    AllHealthRows = $allHealthRows
+    RuntimeInfo = [ordered]@{
+        TotalDCs = $domainControllers.Count
+        PortChecksCompleted = $connectivity.Count
+        DCDiagCompleted = $dcdiagHealth.Count
+        GPOProcessed = $gpoHealth.Count
+    }
+}
+
+#region HTML Output
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    $safeForestName = $forestInfo.Name -replace '[^a-zA-Z0-9.-]', '_'
+    $OutputPath = Join-Path -Path (Get-Location) -ChildPath ("ADHealthDashboard_{0}_{1}.html" -f $safeForestName, (Get-Date -Format 'yyyyMMdd_HHmmss'))
+}
+
+$reportJson = $report | ConvertTo-Json -Depth 20
+
+# Replace any problematic characters in JSON for HTML embedding
+$reportJson = $reportJson -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;'
+
+$htmlTemplate = @'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Active Directory Health Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #eee;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        /* Header */
+        .header {
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 12px;
+            padding: 20px 25px;
+            margin-bottom: 25px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .header h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .header .meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+            font-size: 13px;
+            color: #aaa;
+            margin-top: 15px;
+        }
+        
+        .header .meta span {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 5px 12px;
+            border-radius: 20px;
+        }
+        
+        /* Tabs */
+        .tabs {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 25px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding-bottom: 10px;
+        }
+        
+        .tab-btn {
+            background: rgba(255, 255, 255, 0.05);
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            color: #ccc;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        
+        .tab-btn:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+        
+        .tab-btn.active {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+        }
+        
+        /* Tab Content */
+        .tab-content {
+            display: none;
+            animation: fadeIn 0.5s ease;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        /* Cards Grid */
+        .cards-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        
+        .card {
+            background: rgba(0, 0, 0, 0.4);
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            transition: transform 0.3s ease;
+        }
+        
+        .card:hover {
+            transform: translateY(-3px);
+            border-color: rgba(102, 126, 234, 0.5);
+        }
+        
+        .card .label {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            color: #888;
+            margin-bottom: 8px;
+        }
+        
+        .card .value {
+            font-size: 32px;
+            font-weight: bold;
+            color: #fff;
+            margin-bottom: 8px;
+        }
+        
+        .card .detail {
+            font-size: 12px;
+            color: #aaa;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        
+        .status-Pass { background: rgba(72, 187, 120, 0.2); color: #48bb78; border: 1px solid #48bb78; }
+        .status-Warn { background: rgba(237, 137, 54, 0.2); color: #ed8936; border: 1px solid #ed8936; }
+        .status-Fail { background: rgba(245, 101, 101, 0.2); color: #f56565; border: 1px solid #f56565; }
+        .status-Info { background: rgba(66, 153, 225, 0.2); color: #4299e1; border: 1px solid #4299e1; }
+        .status-Skipped { background: rgba(113, 128, 150, 0.2); color: #718096; border: 1px solid #718096; }
+        
+        /* Tables */
+        .table-wrapper {
+            overflow-x: auto;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 12px;
+            margin-bottom: 25px;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        
+        th, td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        
+        th {
+            background: rgba(102, 126, 234, 0.2);
+            font-weight: 600;
+            color: #ddd;
+            position: sticky;
+            top: 0;
+        }
+        
+        tr:hover td {
+            background: rgba(255, 255, 255, 0.03);
+        }
+        
+        /* Section Headers */
+        .section-header {
+            margin: 25px 0 15px 0;
+            padding-bottom: 10px;
+            border-bottom: 2px solid rgba(102, 126, 234, 0.5);
+        }
+        
+        .section-header h2 {
+            font-size: 20px;
+            color: #ddd;
+        }
+        
+        /* Footer */
+        .footer {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            text-align: center;
+            font-size: 12px;
+            color: #777;
+        }
+        
+        /* Utility */
+        .text-muted { color: #888; }
+        .small { font-size: 11px; }
+        
+        /* Recommendation cards */
+        .recommendation-card {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 12px;
+            border-left: 4px solid;
+        }
+        
+        .rec-critical { border-left-color: #f56565; }
+        .rec-warning { border-left-color: #ed8936; }
+        .rec-info { border-left-color: #4299e1; }
+        
+        .recommendation-card .title {
+            font-weight: bold;
+            margin-bottom: 8px;
+        }
+        
+        .recommendation-card .details {
+            font-size: 13px;
+            color: #aaa;
+            margin-bottom: 8px;
+        }
+        
+        .recommendation-card .action {
+            font-size: 12px;
+            color: #667eea;
+        }
+        
+        /* Search */
+        .search-box {
+            margin-bottom: 15px;
+        }
+        
+        .search-box input {
+            width: 100%;
+            max-width: 300px;
+            padding: 8px 12px;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            color: white;
+        }
+        
+        .search-box input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        /* Data tables */
+        .dataTables_wrapper .dataTables_filter input {
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🏥 Active Directory Health Dashboard</h1>
+            <div class="meta" id="headerMeta"></div>
+        </div>
+        
+        <div class="tabs" id="tabs"></div>
+        
+        <div id="tabContents"></div>
+        
+        <div class="footer">
+            <p>Generated by AD Health Check Script | Data is a point-in-time snapshot | Verify critical findings with native tools</p>
+        </div>
+    </div>
+    
+    <script>
+        const reportData = __REPORT_JSON__;
+        
+        // Helper functions
+        function statusBadge(status) {
+            const s = status || 'Info';
+            return `<span class="status-badge status-${s}">${s}</span>`;
+        }
+        
+        function formatValue(val) {
+            if (val === null || val === undefined) return '-';
+            if (typeof val === 'object') return JSON.stringify(val).substring(0, 100);
+            return String(val);
+        }
+        
+        function renderTable(data, columns) {
+            if (!data || data.length === 0) {
+                return '<div class="text-muted" style="padding: 20px; text-align: center;">No data available</div>';
+            }
+            
+            let html = '<div class="table-wrapper"><table><thead><tr>';
+            for (const col of columns) {
+                html += `<th>${col.label}</th>`;
+            }
+            html += '</tr></thead><tbody>';
+            
+            for (const row of data) {
+                html += '<tr>';
+                for (const col of columns) {
+                    let value = row[col.key];
+                    if (col.status) {
+                        value = statusBadge(value);
+                    } else {
+                        value = formatValue(value);
+                    }
+                    html += `<td>${value}</td>`;
+                }
+                html += '</tr>';
+            }
+            html += '</tbody></table></div>';
+            return html;
+        }
+        
+        function renderCards(cards) {
+            return `<div class="cards-grid">${cards.map(card => `
+                <div class="card">
+                    <div class="label">${card.Label}</div>
+                    <div class="value">${card.Value}</div>
+                    ${statusBadge(card.Status)}
+                    <div class="detail">${card.Detail || ''}</div>
+                </div>
+            `).join('')}</div>`;
+        }
+        
+        // Tab definitions
+        const tabs = [
+            { id: 'summary', name: '📊 Summary' },
+            { id: 'dcinventory', name: '🖥️ DC Inventory' },
+            { id: 'connectivity', name: '🔌 Connectivity' },
+            { id: 'ad', name: '🏢 AD Structure' },
+            { id: 'replication', name: '🔄 Replication' },
+            { id: 'dns', name: '🌐 DNS' },
+            { id: 'services', name: '⚙️ Services' },
+            { id: 'gpo', name: '📋 GPO' },
+            { id: 'recommendations', name: '⚠️ Recommendations' },
+            { id: 'raw', name: '📄 Raw Data' }
+        ];
+        
+        // Render functions for each tab
+        const renderers = {
+            summary: () => {
+                return `
+                    ${renderCards(reportData.SummaryCards)}
+                    <div class="section-header"><h2>📈 Health Overview</h2></div>
+                    ${renderTable(reportData.AllHealthRows, [
+                        { key: 'Status', label: 'Status', status: true },
+                        { key: 'Area', label: 'Area' },
+                        { key: 'Target', label: 'Target' },
+                        { key: 'Name', label: 'Check' },
+                        { key: 'Message', label: 'Message' }
+                    ])}
+                `;
+            },
+            
+            dcinventory: () => {
+                return `
+                    <div class="section-header"><h2>🖥️ Domain Controller Inventory</h2></div>
+                    ${renderTable(reportData.DcInventory, [
+                        { key: 'Status', label: 'Status', status: true },
+                        { key: 'Target', label: 'DC Name' },
+                        { key: 'Domain', label: 'Domain' },
+                        { key: 'Site', label: 'Site' },
+                        { key: 'OperatingSystem', label: 'OS' },
+                        { key: 'Version', label: 'Version' },
+                        { key: 'PatchStatus', label: 'Patch Status', status: true },
+                        { key: 'LatestHotFixID', label: 'Latest Hotfix' },
+                        { key: 'LatestHotFixDate', label: 'Hotfix Date' },
+                        { key: 'UptimeDays', label: 'Uptime (Days)' },
+                        { key: 'TotalMemoryGB', label: 'Memory (GB)' },
+                        { key: 'IsGlobalCatalog', label: 'GC' },
+                        { key: 'IsReadOnly', label: 'RODC' }
+                    ])}
+                `;
+            },
+            
+            connectivity: () => {
+                return `
+                    <div class="section-header"><h2>🔌 Port Connectivity Summary</h2></div>
+                    ${renderTable(reportData.ConnectivitySummary, [
+                        { key: 'Status', label: 'Status', status: true },
+                        { key: 'Target', label: 'DC Name' },
+                        { key: 'Domain', label: 'Domain' },
+                        { key: 'Site', label: 'Site' },
+                        { key: 'RequiredPortsOpen', label: 'Ports Open' },
+                        { key: 'RequiredFirewallGuidance', label: 'Guidance' }
+                    ])}
+                    
+                    <div class="section-header"><h2>🔌 Port Reference</h2></div>
+                    ${renderTable(reportData.PortDefinitions, [
+                        { key: 'Port', label: 'Port' },
+                        { key: 'Protocol', label: 'Protocol' },
+                        { key: 'Required', label: 'Required' },
+                        { key: 'Purpose', label: 'Purpose' }
+                    ])}
+                `;
+            },
+            
+            ad: () => {
+                return `
+                    <div class="section-header"><h2>🏢 Forest Information</h2></div>
+                    ${renderTable([reportData.Forest], [
+                        { key: 'Name', label: 'Forest Name' },
+                        { key: 'ForestMode', label: 'Forest Mode' },
+                        { key: 'RootDomain', label: 'Root Domain' },
+                        { key: 'SchemaMaster', label: 'Schema Master' },
+                        { key: 'DomainNamingRole', label: 'Domain Naming Master' }
+                    ])}
+                    
+                    <div class="section-header"><h2>🏢 Domains</h2></div>
+                    ${renderTable(reportData.Domains, [
+                        { key: 'Name', label: 'Domain Name' },
+                        { key: 'NetBIOSName', label: 'NetBIOS' },
+                        { key: 'DomainMode', label: 'Domain Mode' },
+                        { key: 'PDCEmulator', label: 'PDC Emulator' },
+                        { key: 'RIDMaster', label: 'RID Master' },
+                        { key: 'InfrastructureMaster', label: 'Infrastructure Master' }
+                    ])}
+                    
+                    <div class="section-header"><h2>🏢 FSMO Roles</h2></div>
+                    ${renderTable(reportData.FSMORoles, [
+                        { key: 'Scope', label: 'Scope' },
+                        { key: 'Role', label: 'Role' },
+                        { key: 'Holder', label: 'Holder' }
+                    ])}
+                    
+                    <div class="section-header"><h2>🏢 Sites & Subnets</h2></div>
+                    ${renderTable(reportData.Sites, [
+                        { key: 'Name', label: 'Site Name' },
+                        { key: 'DcCount', label: 'DC Count' },
+                        { key: 'Location', label: 'Location' }
+                    ])}
+                `;
+            },
+            
+            replication: () => {
+                return `
+                    <div class="section-header"><h2>🔄 Replication Status</h2></div>
+                    ${renderTable(reportData.ReplicationHealth, [
+                        { key: 'Status', label: 'Status', status: true },
+                        { key: 'Target', label: 'Target DC' },
+                        { key: 'Message', label: 'Message' }
+                    ])}
+                `;
+            },
+            
+            dns: () => {
+                return `
+                    <div class="section-header"><h2>🌐 DNS Health</h2></div>
+                    ${renderTable(reportData.DnsHealth, [
+                        { key: 'Status', label: 'Status', status: true },
+                        { key: 'Target', label: 'DNS Server' },
+                        { key: 'Test', label: 'Test' },
+                        { key: 'Message', label: 'Message' }
+                    ])}
+                `;
+            },
+            
+            services: () => {
+                return `
+                    <div class="section-header"><h2>⚙️ Critical Services</h2></div>
+                    ${renderTable(reportData.Services, [
+                        { key: 'Status', label: 'Status', status: true },
+                        { key: 'Target', label: 'DC Name' },
+                        { key: 'ServiceName', label: 'Service' },
+                        { key: 'State', label: 'State' },
+                        { key: 'Message', label: 'Message' }
+                    ])}
+                    
+                    <div class="section-header"><h2>📁 SYSVOL & NETLOGON</h2></div>
+                    ${renderTable(reportData.Shares, [
+                        { key: 'Status', label: 'Status', status: true },
+                        { key: 'Target', label: 'DC Name' },
+                        { key: 'Share', label: 'Share' },
+                        { key: 'Message', label: 'Message' }
+                    ])}
+                    
+                    <div class="section-header"><h2>⏰ Time Synchronization</h2></div>
+                    ${renderTable(reportData.TimeHealth, [
+                        { key: 'Status', label: 'Status', status: true },
+                        { key: 'Target', label: 'DC Name' },
+                        { key: 'Source', label: 'Time Source' },
+                        { key: 'Stratum', label: 'Stratum' }
+                    ])}
+                `;
+            },
+            
+            gpo: () => {
+                return `
+                    <div class="section-header"><h2>📋 Group Policy Objects</h2></div>
+                    ${renderTable(reportData.GpoHealth, [
+                        { key: 'Status', label: 'Status', status: true },
+                        { key: 'Domain', label: 'Domain' },
+                        { key: 'Name', label: 'GPO Name' },
+                        { key: 'GpoStatus', label: 'Status' },
+                        { key: 'Created', label: 'Created' },
+                        { key: 'Modified', label: 'Modified' }
+                    ])}
+                `;
+            },
+            
+            recommendations: () => {
+                if (!reportData.Recommendations || reportData.Recommendations.length === 0) {
+                    return '<div class="text-muted" style="padding: 20px; text-align: center;">No recommendations at this time.</div>';
+                }
+                
+                return `
+                    <div class="section-header"><h2>⚠️ Recommendations & Actions</h2></div>
+                    ${reportData.Recommendations.map(rec => `
+                        <div class="recommendation-card rec-${rec.Severity.toLowerCase()}">
+                            <div class="title">${rec.Title}</div>
+                            <div class="details">${rec.Details}</div>
+                            <div class="action">🔧 ${rec.Action}</div>
+                        </div>
+                    `).join('')}
+                `;
+            },
+            
+            raw: () => {
+                return `
+                    <div class="section-header"><h2>📄 Raw Command Output</h2></div>
+                    ${(reportData.RawCommands || []).map(cmd => `
+                        <div class="section-header"><h3>${cmd.Name}</h3></div>
+                        <pre style="background: rgba(0,0,0,0.4); padding: 15px; border-radius: 8px; overflow-x: auto; font-size: 11px;">${cmd.Output || '(no output)'}</pre>
+                    `).join('')}
+                `;
+            }
+        };
+        
+        // Build UI
+        function buildUI() {
+            // Header meta
+            const metaHtml = `
+                <span>📅 ${reportData.Metadata.GeneratedAt}</span>
+                <span>💻 ${reportData.Metadata.RunHost}</span>
+                <span>👤 ${reportData.Metadata.RunUser}</span>
+                <span>📦 v${reportData.Metadata.ScriptVersion}</span>
+                <span>⏱️ ${reportData.Metadata.RuntimeSeconds}s</span>
+                <span>💾 Cache: ${reportData.Metadata.CacheUsed}</span>
+                <span>${statusBadge(reportData.OverallStatus)}</span>
+            `;
+            document.getElementById('headerMeta').innerHTML = metaHtml;
+            
+            // Tabs
+            const tabsContainer = document.getElementById('tabs');
+            const tabContentsContainer = document.getElementById('tabContents');
+            
+            tabs.forEach((tab, idx) => {
+                // Create tab button
+                const btn = document.createElement('button');
+                btn.className = 'tab-btn' + (idx === 0 ? ' active' : '');
+                btn.textContent = tab.name;
+                btn.onclick = () => activateTab(tab.id, idx);
+                tabsContainer.appendChild(btn);
+                
+                // Create tab content
+                const contentDiv = document.createElement('div');
+                contentDiv.id = `tab-${tab.id}`;
+                contentDiv.className = 'tab-content' + (idx === 0 ? ' active' : '');
+                contentDiv.innerHTML = renderers[tab.id] ? renderers[tab.id]() : '<div>Content not available</div>';
+                tabContentsContainer.appendChild(contentDiv);
+            });
+        }
+        
+        function activateTab(tabId, index) {
+            // Update tab buttons
+            document.querySelectorAll('.tab-btn').forEach((btn, i) => {
+                btn.classList.toggle('active', i === index);
+            });
+            
+            // Update tab contents
+            document.querySelectorAll('.tab-content').forEach((content, i) => {
+                content.classList.toggle('active', i === index);
+            });
+        }
+        
+        // Initialize
+        buildUI();
+    </script>
+</body>
+</html>
+'@
+
+$html = $htmlTemplate.Replace('__REPORT_JSON__', $reportJson)
+
+$outputDirectory = Split-Path -Path $OutputPath -Parent
+if (-not [string]::IsNullOrWhiteSpace($outputDirectory) -and -not (Test-Path -Path $outputDirectory)) {
+    New-Item -Path $outputDirectory -ItemType Directory -Force | Out-Null
+}
+
+Set-Content -Path $OutputPath -Value $html -Encoding UTF8
+
+Write-Host "`n========================================" -ForegroundColor Green
+Write-Host "✅ AD health dashboard saved to:" -ForegroundColor Green
+Write-Host "   $OutputPath" -ForegroundColor White
+Write-Host "========================================" -ForegroundColor Green
+Write-Host ""
+Write-Host "📊 Summary Statistics:" -ForegroundColor Cyan
+Write-Host "   - Overall Status: $overallStatus" -ForegroundColor $(if ($overallStatus -eq 'Pass') { 'Green' } elseif ($overallStatus -eq 'Warn') { 'Yellow' } else { 'Red' })
+Write-Host "   - Domains: $($domains.Count)" -ForegroundColor Gray
+Write-Host "   - Domain Controllers: $($domainControllers.Count)" -ForegroundColor Gray
+Write-Host "   - Connectivity Issues: $($connectivitySummary | Where-Object { $_.Status -eq 'Fail' } | Measure-Object | Select-Object -ExpandProperty Count)" -ForegroundColor Yellow
+Write-Host "   - Replication Issues: $($replicationHealth | Where-Object { $_.Status -eq 'Fail' } | Measure-Object | Select-Object -ExpandProperty Count)" -ForegroundColor Yellow
+Write-Host "   - Recommendations: $($recommendations.Count)" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "💾 Cache Location: $CachePath" -ForegroundColor Gray
+Write-Host "   (Delete this folder or use -ForceRefresh to bypass cache)" -ForegroundColor Gray
+
+if ($OpenReport) {
+    Start-Process $OutputPath
+}
+
+[pscustomobject]@{
+    OutputPath = (Resolve-Path -Path $OutputPath).Path
+    OverallStatus = $overallStatus
+    DomainCount = $domains.Count
+    DcCount = $domainControllers.Count
+    RecommendationCount = $recommendations.Count
+}
+#endregion
