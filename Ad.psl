@@ -46,15 +46,144 @@ function Get-SvcBadge {
     return "<span class='svc $cls'>$(HtmlSafe $Status)</span>"
 }
 
+function Test-Port {
+    param(
+        [string]$ComputerName,
+        [int]$Port,
+        [int]$TimeoutMs = 1000
+    )
+    try {
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $asyncResult = $tcpClient.BeginConnect($ComputerName, $Port, $null, $null)
+        $wait = $asyncResult.AsyncWaitHandle.WaitOne($TimeoutMs)
+        if ($wait) {
+            $tcpClient.EndConnect($asyncResult)
+            $tcpClient.Close()
+            return $true
+        }
+        else {
+            $tcpClient.Close()
+            return $false
+        }
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-DCServicesStatus {
+    param(
+        [string]$ComputerName,
+        [int]$PortCheckTimeoutMs = 2000
+    )
+    
+    # Required ports for DC communication
+    $requiredPorts = @{
+        "LDAP" = 389
+        "LDAPS" = 636
+        "GC" = 3268
+        "GCSSL" = 3269
+        "Kerberos" = 88
+        "Kerberos-ChangePW" = 464
+        "DNS" = 53
+        "NetLogon" = 445
+        "RPC" = 135
+        "SMB" = 445
+        "WinRM" = 5985
+        "SecureWinRM" = 5986
+        "Kpasswd" = 464
+        "NTP" = 123
+        "GlobalCatalog" = 3268
+    }
+    
+    $portStatus = @{}
+    foreach ($portName in $requiredPorts.Keys) {
+        $portStatus[$portName] = Test-Port -ComputerName $ComputerName -Port $requiredPorts[$portName] -TimeoutMs $PortCheckTimeoutMs
+    }
+    
+    # Method 1: Try Get-Service via WinRM (most reliable if enabled)
+    $services = @{ NTDS = 'Unknown'; Netlogon = 'Unknown'; KDC = 'Unknown'; DFSR = 'Unknown'; DNS = 'Unknown' }
+    $serviceError = $null
+    $winrmAvailable = $portStatus["WinRM"] -or $portStatus["SecureWinRM"]
+    
+    if ($winrmAvailable) {
+        try {
+            $svcNames = @('NTDS', 'Netlogon', 'KDC', 'DFSR', 'DNS')
+            $serviceQuery = @()
+            foreach ($svc in $svcNames) {
+                try {
+                    $svcResult = Get-Service -ComputerName $ComputerName -Name $svc -ErrorAction Stop
+                    $services[$svc] = $svcResult.Status.ToString()
+                    $serviceQuery += $svcResult
+                }
+                catch {
+                    $services[$svc] = 'Not Found'
+                }
+            }
+        }
+        catch {
+            $serviceError = "WinRM query failed: $($_.Exception.Message)"
+        }
+    }
+    
+    # Method 2: Fallback to WMI/CIM if WinRM failed
+    if ($services.Values | Where-Object { $_ -eq 'Unknown' -or $_ -eq 'Not Found' }) {
+        try {
+            $cimSession = New-CimSession -ComputerName $ComputerName -ErrorAction SilentlyContinue -OperationTimeoutSec 10
+            if ($cimSession) {
+                $cimServices = Get-CimInstance -CimSession $cimSession -ClassName Win32_Service -Filter "Name='NTDS' OR Name='Netlogon' OR Name='KDC' OR Name='DFSR' OR Name='DNS'" -ErrorAction SilentlyContinue
+                foreach ($cimSvc in $cimServices) {
+                    $services[$cimSvc.Name] = $cimSvc.State
+                }
+                Remove-CimSession $cimSession
+            }
+        }
+        catch {
+            if (-not $serviceError) { $serviceError = "CIM query failed: $($_.Exception.Message)" }
+        }
+    }
+    
+    # Method 3: Test service via SMB/RPC (check if service ports are responsive)
+    if ($services.Values | Where-Object { $_ -eq 'Unknown' -or $_ -eq 'Not Found' }) {
+        # Use service status based on port availability
+        if ($portStatus["LDAP"] -and $portStatus["Kerberos"]) {
+            if ($services["NTDS"] -eq 'Unknown') { $services["NTDS"] = 'Running' }
+            if ($services["KDC"] -eq 'Unknown') { $services["KDC"] = 'Running' }
+        }
+        if ($portStatus["NetLogon"] -or $portStatus["SMB"]) {
+            if ($services["Netlogon"] -eq 'Unknown') { $services["Netlogon"] = 'Running' }
+        }
+        if ($portStatus["DNS"]) {
+            if ($services["DNS"] -eq 'Unknown') { $services["DNS"] = 'Running' }
+        }
+        # DFSR is harder to detect without WinRM, mark as unknown but not failed
+        if ($services["DFSR"] -eq 'Unknown') { $services["DFSR"] = 'Unknown' }
+    }
+    
+    return @{
+        Services = $services
+        Ports = $portStatus
+        Error = $serviceError
+        WinRMAvailable = $winrmAvailable
+    }
+}
+
 function Write-HealthRunbook {
     $lines = @(
         'AD Daily Health Summary Runbook',
         '',
+        'Required Ports for DC Communication:',
+        '  - LDAP: 389, LDAPS: 636',
+        '  - Global Catalog: 3268, 3269',
+        '  - Kerberos: 88, 464',
+        '  - DNS: 53',
+        '  - NetLogon/SMB: 445',
+        '  - WinRM: 5985 (HTTP), 5986 (HTTPS)',
+        '  - RPC: 135',
+        '  - NTP: 123',
+        '',
         'Standard daily run:',
         'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1',
-        '',
-        'Custom output folder:',
-        'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -OutputDirectory C:\Temp\AD_Daily_Health',
         '',
         'Large environment with 200+ DCs:',
         'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -MaxConcurrency 30 -EventLookbackHours 2',
@@ -62,7 +191,7 @@ function Write-HealthRunbook {
         'Run without repadmin text block:',
         'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -IncludeReplicationText:$false',
         '',
-        'Demo mode (safe showcase output):',
+        'Demo mode:',
         'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -DemoMode -DemoDomainControllerLimit 10',
         '',
         'Print this runbook only:',
@@ -241,50 +370,65 @@ function Get-DCEventLogs {
     return $result
 }
 
-# DC health check script
+# DC health check script (UPDATED with port-based service detection)
 $dcCheckScript = {
     param([string]$HostName, [string]$Domain, [string]$Site, [string]$IPv4, [datetime]$EventStartTime, [int]$EventTimeout)
     
     $reachable = $false
-    try { $reachable = [bool](Test-Connection -ComputerName $HostName -Count 1 -Quiet -ErrorAction Stop) }
-    catch { $reachable = $false }
-    
-    $svc = @{ NTDS = 'Unknown'; Netlogon = 'Unknown'; KDC = 'Unknown'; DFSR = 'Unknown'; DNS = 'Unknown' }
-    $svcError = ''
-    
-    if ($reachable) {
-        try {
-            $services = @(Get-Service -ComputerName $HostName -Name NTDS, Netlogon, KDC, DFSR, DNS -ErrorAction Stop)
-            foreach ($s in $services) { $svc[[string]$s.Name] = [string]$s.Status }
-        }
-        catch {
-            $svcError = $_.Exception.Message
-            foreach ($k in @('NTDS', 'Netlogon', 'KDC', 'DFSR', 'DNS')) { $svc[$k] = 'Unavailable' }
+    $pingLatencyMs = $null
+    try { 
+        $ping = Test-Connection -ComputerName $HostName -Count 1 -Quiet -ErrorAction Stop
+        $reachable = $ping
+        if ($reachable) {
+            $pingDetail = Test-Connection -ComputerName $HostName -Count 1 -ErrorAction SilentlyContinue
+            if ($pingDetail) { $pingLatencyMs = [int]$pingDetail.ResponseTime }
         }
     }
+    catch { $reachable = $false }
     
-    $anyBad = @($svc.Values | Where-Object { $_ -notin @('Running', 'Unknown') })
+    $services = @{ NTDS = 'Unknown'; Netlogon = 'Unknown'; KDC = 'Unknown'; DFSR = 'Unknown'; DNS = 'Unknown' }
+    $portStatus = @{}
+    $serviceError = ''
+    $winrmAvailable = $false
+    
+    if ($reachable) {
+        $svcStatus = Get-DCServicesStatus -ComputerName $HostName -PortCheckTimeoutMs 2000
+        $services = $svcStatus.Services
+        $portStatus = $svcStatus.Ports
+        $winrmAvailable = $svcStatus.WinRMAvailable
+        if ($svcStatus.Error) { $serviceError = $svcStatus.Error }
+    }
+    
+    $anyBad = @($services.Values | Where-Object { $_ -notin @('Running', 'Unknown') })
     $dcStatus = if (-not $reachable) { 'Red' } elseif ($anyBad.Count -gt 0) { 'Yellow' } else { 'Green' }
     
+    # Get events only if reachable
     $events = $null
     if ($reachable) {
         $events = Get-DCEventLogs -ComputerName $HostName -StartTime $EventStartTime -TimeoutSeconds $EventTimeout
     }
     
     [pscustomobject]@{
-        Domain      = $Domain
-        HostName    = $HostName
-        Site        = $Site
-        IPv4Address = $IPv4
-        Reachable   = $reachable
-        NTDS        = $svc['NTDS']
-        Netlogon    = $svc['Netlogon']
-        KDC         = $svc['KDC']
-        DFSR        = $svc['DFSR']
-        DNS         = $svc['DNS']
-        SvcError    = $svcError
-        DcStatus    = $dcStatus
-        Events      = $events
+        Domain          = $Domain
+        HostName        = $HostName
+        Site            = $Site
+        IPv4Address     = $IPv4
+        Reachable       = $reachable
+        PingLatencyMs   = $pingLatencyMs
+        NTDS            = $services['NTDS']
+        Netlogon        = $services['Netlogon']
+        KDC             = $services['KDC']
+        DFSR            = $services['DFSR']
+        DNS             = $services['DNS']
+        WinRMAvailable  = $winrmAvailable
+        PortLDAP        = if ($portStatus.ContainsKey('LDAP')) { $portStatus['LDAP'] } else { $false }
+        PortKerberos    = if ($portStatus.ContainsKey('Kerberos')) { $portStatus['Kerberos'] } else { $false }
+        PortDNS         = if ($portStatus.ContainsKey('DNS')) { $portStatus['DNS'] } else { $false }
+        PortSMB         = if ($portStatus.ContainsKey('SMB')) { $portStatus['SMB'] } else { $false }
+        PortWinRM       = if ($portStatus.ContainsKey('WinRM')) { $portStatus['WinRM'] } else { $false }
+        SvcError        = $serviceError
+        DcStatus        = $dcStatus
+        Events          = $events
     }
 }
 
@@ -361,6 +505,13 @@ foreach ($job in $jobs) {
 $pool.Close()
 $pool.Dispose()
 Write-Log ("Parallel collection complete. {0} results." -f $dcRows.Count)
+
+# Count DCs with service detection issues
+$dcsWithServiceIssues = @($dcRows | Where-Object { 
+    $_.NTDS -eq 'Unavailable' -or $_.NTDS -eq 'Unknown' -or 
+    $_.Netlogon -eq 'Unavailable' -or $_.Netlogon -eq 'Unknown'
+})
+Write-Log ("DCs with potential service detection issues: {0}" -f $dcsWithServiceIssues.Count) -Level WARN
 
 # Aggregate events across all DCs
 $aggregatedEvents = @{
@@ -536,14 +687,17 @@ $siteCardsHtml = (@($siteStats) | ForEach-Object {
 }) -join [Environment]::NewLine
 
 $priorityHtml = if ($issueRows.Count -eq 0) {
-    "<tr><td colspan='9'>No issues detected in this run.</td></tr>"
+    "<tr><td colspan='11'>No issues detected in this run.</td></tr>"
 } else {
     (@($issueRows | Sort-Object DcStatus, Site, HostName) | ForEach-Object {
         $rc = if ($_.DcStatus -eq 'Red') { 'row-red' } else { 'row-yellow' }
         "<tr class='$rc'><td>$(HtmlSafe $_.Site)</td><td>$(HtmlSafe $_.HostName)</td>" +
-        "<td>$(HtmlSafe $_.IPv4Address)</td><td>$(HtmlSafe $_.Reachable)</td>" +
-        "<td>$(HtmlSafe $_.NTDS)</td><td>$(HtmlSafe $_.Netlogon)</td>" +
-        "<td>$(HtmlSafe $_.KDC)</td><td>$(HtmlSafe $_.DFSR)</td><td>$(HtmlSafe $_.DNS)</td></tr>"
+        "<td>$(HtmlSafe $_.IPv4Address)</td><td style='text-align:center'>$(if($_.Reachable){'✓'}else{'✗'})</td>" +
+        "<td>$(Get-SvcBadge $_.NTDS)</td><td>$(Get-SvcBadge $_.Netlogon)</td>" +
+        "<td>$(Get-SvcBadge $_.KDC)</td><td>$(Get-SvcBadge $_.DFSR)</td><td>$(Get-SvcBadge $_.DNS)</td>" +
+        "<td style='font-size:10px'>$(if($_.PortLDAP){'LDAP✓'}else{'LDAP✗'})<br>$(if($_.PortKerberos){'KRB✓'}else{'KRB✗'})</td></td>" +
+        "<td style='font-size:10px'>$(if($_.PortDNS){'DNS✓'}else{'DNS✗'})<br>$(if($_.PortSMB){'SMB✓'}else{'SMB✗'})</td></td>" +
+        "<td style='font-size:10px'>$(if($_.WinRMAvailable){'WinRM✓'}else{'WinRM✗'})</td></td>"
     }) -join [Environment]::NewLine
 }
 
@@ -563,7 +717,7 @@ $replFailHtml = if ($replFailureRows.Count -eq 0) {
     }) -join [Environment]::NewLine
 }
 
-# Event Tables HTML
+# Function to format event tables
 function Format-EventTable {
     param($Events, $Title, $Columns = @('Time', 'DC', 'Event ID', 'Message'))
     
@@ -574,7 +728,7 @@ function Format-EventTable {
     $rows = @()
     foreach ($evt in $Events | Select-Object -First 100) {
         $dc = if ($evt.DC) { $evt.DC } else { $evt.ComputerName }
-        $rows += "<tr><td>$(HtmlSafe $evt.Time)</td><td>$(HtmlSafe $dc)</td><td>$($evt.Id)</td><td>$(HtmlSafe $evt.Message)</td></tr>"
+        $rows += "<tr><td>$(HtmlSafe $evt.Time)</td><td>$(HtmlSafe $dc)</td><td style='text-align:center'>$($evt.Id)</td><td>$(HtmlSafe $evt.Message)</td></tr>"
     }
     
     $moreMsg = if ($Events.Count -gt 100) { "<p class='meta'>+ $($Events.Count - 100) more events (see CSV for full list)</p>" } else { "" }
@@ -607,10 +761,14 @@ $siteGroupHtml = (@($dcRows | Group-Object -Property Site | Sort-Object Name) | 
         $rc        = switch ($_.DcStatus) { 'Red' { 'dc-row row-red' } 'Yellow' { 'dc-row row-yellow' } default { 'dc-row' } }
         $reachIcon = if ($_.Reachable) { "<span class='svc svc-ok'>&#10003;</span>" } else { "<span class='svc svc-bad'>&#10007;</span>" }
         $search    = ($_.HostName + ' ' + $_.IPv4Address + ' ' + $_.Site).ToLower()
+        $pingInfo = if ($_.PingLatencyMs) { "$($_.PingLatencyMs)ms" } else { '-' }
         "<tr class='$rc' data-search='$(HtmlSafe $search)'>" +
-        "<td>$(HtmlSafe $_.HostName)</td><td>$(HtmlSafe $_.IPv4Address)</td><td>$reachIcon</td>" +
+        "<td>$(HtmlSafe $_.HostName)</td><td style='font-size:10px'>$pingInfo</td><td>$(HtmlSafe $_.IPv4Address)</td><td style='text-align:center'>$reachIcon</td>" +
         "<td>$(Get-SvcBadge $_.NTDS)</td><td>$(Get-SvcBadge $_.Netlogon)</td>" +
-        "<td>$(Get-SvcBadge $_.KDC)</td><td>$(Get-SvcBadge $_.DFSR)</td><td>$(Get-SvcBadge $_.DNS)</td></tr>"
+        "<td>$(Get-SvcBadge $_.KDC)</td><td>$(Get-SvcBadge $_.DFSR)</td><td>$(Get-SvcBadge $_.DNS)</td>" +
+        "<td style='font-size:10px;text-align:center'>$(if($_.PortLDAP){'✓'}else{'✗'})<br>$(if($_.PortKerberos){'✓'}else{'✗'})</td>" +
+        "<td style='font-size:10px;text-align:center'>$(if($_.PortDNS){'✓'}else{'✗'})<br>$(if($_.PortSMB){'✓'}else{'✗'})</td>" +
+        "<td style='font-size:10px;text-align:center'>$(if($_.WinRMAvailable){'✓'}else{'✗'})</td></table>"
     }) -join [Environment]::NewLine
 
     $block  = "<div class='site-section'>"
@@ -620,9 +778,9 @@ $siteGroupHtml = (@($dcRows | Group-Object -Property Site | Sort-Object Name) | 
     $block += "<span class='dc-count'>$dcCountText</span>"
     $block += "<span class='toggle-hint'>(click to expand)</span></div>"
     $block += "<div id='site-$safeId' class='site-table' style='display:none'>"
-    $block += "<table><thead><tr><th>Domain Controller</th><th>IP Address</th><th>Reachable</th>"
-    $block += "<th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></tr></thead>"
-    $block += "<tbody>$rows</tbody></table></div></div>"
+    $block += "<tr><thead>"
+    $block += "<tr><th>DC</th><th>Ping</th><th>IP</th><th>Reach</th><th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th><th>LDAP/KRB</th><th>DNS/SMB</th><th>WinRM</th></tr>"
+    $block += "</thead><tbody>$rows</tbody>}</div></div>"
     $block
 }) -join [Environment]::NewLine
 
@@ -630,7 +788,7 @@ $privHtml = if ($memberRows.Count -eq 0) {
     "<tr><td colspan='4'>No privileged group members returned.</td></tr>"
 } else {
     (@($memberRows | Select-Object -First 50) | ForEach-Object {
-        "<tr><td>$(HtmlSafe $_.PrivilegedGroup)</td><td>$(HtmlSafe $_.MemberName)</td>" +
+        "<tr><td style='font-weight:bold'>$(HtmlSafe $_.PrivilegedGroup)</td><td>$(HtmlSafe $_.MemberName)</td>" +
         "<td>$(HtmlSafe $_.MemberSam)</td><td>$(HtmlSafe $_.MemberClass)</td></tr>"
     }) -join [Environment]::NewLine
 }
@@ -638,12 +796,31 @@ $privHtml = if ($memberRows.Count -eq 0) {
 $healthLower = $healthStatus.ToLowerInvariant()
 $healthRunExamples = @(
     'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1',
-    'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -OutputDirectory C:\Temp\AD_Daily_Health',
     'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -MaxConcurrency 30 -EventLookbackHours 2',
-    'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -IncludeReplicationText:$false',
-    'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -DemoMode -DemoDomainControllerLimit 10'
+    'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -IncludeReplicationText:$false'
 )
 $healthRunExamplesHtml = (@($healthRunExamples) | ForEach-Object { "<li><code>$(HtmlSafe $_)</code></li>" }) -join [Environment]::NewLine
+
+# Required ports documentation HTML
+$requiredPortsHtml = @"
+<h3>Required Ports for Domain Controller Communication</h3>
+<table style='width: auto; margin: 10px 0;'>
+<thead><tr><th>Port</th><th>Protocol</th><th>Service</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td>389</td><td>TCP/UDP</td><td>LDAP</td><td>Directory Service queries</td></tr>
+<tr><td>636</td><td>TCP</td><td>LDAPS</td><td>Secure LDAP</td></tr>
+<tr><td>3268</td><td>TCP</td><td>Global Catalog</td><td>Forest-wide searches</td></tr>
+<tr><td>3269</td><td>TCP</td><td>Global Catalog SSL</td><td>Secure GC</td></tr>
+<tr><td>88</td><td>TCP/UDP</td><td>Kerberos</td><td>Authentication</td></tr>
+<tr><td>464</td><td>TCP/UDP</td><td>Kerberos Change PW</td><td>Password changes</td></tr>
+<tr><td>53</td><td>TCP/UDP</td><td>DNS</td><td>Name resolution</td></tr>
+<tr><td>445</td><td>TCP</td><td>SMB/NetLogon</td><td>NetLogon, SYSVOL access</td></tr>
+<tr><td>135</td><td>TCP</td><td>RPC</td><td>Remote procedure calls</td></tr>
+<tr><td>5985</td><td>TCP</td><td>WinRM HTTP</td><td>Remote management</td></tr>
+<tr><td>5986</td><td>TCP</td><td>WinRM HTTPS</td><td>Secure remote management</td></tr>
+</tbody>
+</table>
+"@
 
 #endregion HTML Generation
 
@@ -758,8 +935,9 @@ pre { background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 8px; ov
 <div class='meta'>Generated: $(HtmlSafe (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))</div>
 <div class='meta'>Domain: $(HtmlSafe $domain.DNSRoot) &nbsp;|&nbsp; Forest: $(HtmlSafe $forest.Name) &nbsp;|&nbsp; Domain Controllers: $($dcRows.Count) &nbsp;|&nbsp; AD Sites: $($siteStats.Count)</div>
 <div class='meta'>Event Lookback: Last $EventLookbackHours hour(s) (starting $(HtmlSafe $eventStartTime))</div>
-<div class='meta'>Audience: IT Operations, Security, Management, and Leadership</div>
 </div>
+
+$requiredPortsHtml
 
 <div class='cards'>
 <div class='card'><div class='k'>Overall Health</div><div class='v'><span class='badge badge-$healthLower'>$(HtmlSafe $healthStatus)</span></div></div>
@@ -769,7 +947,6 @@ pre { background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 8px; ov
 <div class='card'><div class='k'>Service Issues</div><div class='v'>$($issueRows.Count)</div></div>
 <div class='card'><div class='k'>Repl Failures</div><div class='v'>$replIssueCount</div></div>
 <div class='card'><div class='k'>Total Events</div><div class='v'>$totalEventsFound</div></div>
-<div class='card'><div class='k'>Critical Events</div><div class='v'>$(($aggregatedEvents.AccountLockouts.Count + $aggregatedEvents.FailedLogons.Count + $aggregatedEvents.UnexpectedShutdown.Count + $aggregatedEvents.GroupMembershipChanges.Count))</div></div>
 </div>
 
 <div class='panel'>
@@ -793,7 +970,9 @@ $siteCardsHtml
 <div class='panel'>
 <h2>Priority DC Issues</h2>
 <table>
-<thead><tr><th>Site</th><th>Domain Controller</th><th>IP</th><th>Reachable</th><th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></tr></thead>
+<thead>
+<tr><th>Site</th><th>DC</th><th>IP</th><th>Reach</th><th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th><th>LDAP/KRB</th><th>DNS/SMB</th><th>WinRM</th></tr>
+</thead>
 <tbody>
 $priorityHtml
 </tbody>
@@ -805,38 +984,26 @@ $priorityHtml
 <div class='meta'>Collected from last $EventLookbackHours hour(s). Full details in CSV: $(HtmlSafe $eventsCsv)</div>
 <div class='tab-container'>
 <div class='tab-buttons'>
-<button class='tab-btn active' onclick='showTab("critical")'>⚠ Critical/Security</button>
-<button class='tab-btn' onclick='showTab("account")'>👤 Account Management</button>
-<button class='tab-btn' onclick='showTab("system")'>🖥 System Events</button>
+<button class='tab-btn active' onclick='showTab("critical")'>⚠ Critical</button>
+<button class='tab-btn' onclick='showTab("account")'>👤 Account</button>
+<button class='tab-btn' onclick='showTab("system")'>🖥 System</button>
 </div>
 <div id='critical' class='tab-content active'>
-$(Format-EventTable -Events $allEventsExport -Title "Critical Security Events" -Columns @('Time','DC','Event ID','Message'))
+$(Format-EventTable -Events $allEventsExport -Title "All Security Events")
 </div>
 <div id='account' class='tab-content'>
 <h3>Account Lockouts ($($aggregatedEvents.AccountLockouts.Count))</h3>
-$(if ($aggregatedEvents.AccountLockouts.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.AccountLockouts -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No account lockouts in the last $EventLookbackHours hour(s).</em></p>" })
+$(if ($aggregatedEvents.AccountLockouts.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.AccountLockouts -Title "" } else { "<p><em>None</em></p>" })
 <h3>Failed Logons ($($aggregatedEvents.FailedLogons.Count))</h3>
-$(if ($aggregatedEvents.FailedLogons.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.FailedLogons -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No failed logons in the last $EventLookbackHours hour(s).</em></p>" })
-<h3>Successful Logons ($($aggregatedEvents.SuccessfulLogons.Count))</h3>
-$(if ($aggregatedEvents.SuccessfulLogons.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.SuccessfulLogons -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No successful logons in the last $EventLookbackHours hour(s).</em></p>" })
-<h3>User Account Changes ($($aggregatedEvents.UserAccountChanges.Count))</h3>
-$(if ($aggregatedEvents.UserAccountChanges.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.UserAccountChanges -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No user account changes in the last $EventLookbackHours hour(s).</em></p>" })
-<h3>Password Changes ($($aggregatedEvents.PasswordChanges.Count))</h3>
-$(if ($aggregatedEvents.PasswordChanges.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.PasswordChanges -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No password changes in the last $EventLookbackHours hour(s).</em></p>" })
+$(if ($aggregatedEvents.FailedLogons.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.FailedLogons -Title "" } else { "<p><em>None</em></p>" })
 <h3>Group Membership Changes ($($aggregatedEvents.GroupMembershipChanges.Count))</h3>
-$(if ($aggregatedEvents.GroupMembershipChanges.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.GroupMembershipChanges -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No group membership changes in the last $EventLookbackHours hour(s).</em></p>" })
-<h3>AD Object Changes ($($aggregatedEvents.ADObjectChanges.Count))</h3>
-$(if ($aggregatedEvents.ADObjectChanges.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.ADObjectChanges -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No AD object changes in the last $EventLookbackHours hour(s).</em></p>" })
+$(if ($aggregatedEvents.GroupMembershipChanges.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.GroupMembershipChanges -Title "" } else { "<p><em>None</em></p>" })
 </div>
 <div id='system' class='tab-content'>
 <h3>Unexpected Shutdowns ($($aggregatedEvents.UnexpectedShutdown.Count))</h3>
-$(if ($aggregatedEvents.UnexpectedShutdown.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.UnexpectedShutdown -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No unexpected shutdowns in the last $EventLookbackHours hour(s).</em></p>" })
+$(if ($aggregatedEvents.UnexpectedShutdown.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.UnexpectedShutdown -Title "" } else { "<p><em>None</em></p>" })
 <h3>Planned Restarts ($($aggregatedEvents.PlannedRestart.Count))</h3>
-$(if ($aggregatedEvents.PlannedRestart.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.PlannedRestart -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No planned restarts in the last $EventLookbackHours hour(s).</em></p>" })
-<h3>Audit Policy Changes ($($aggregatedEvents.AuditPolicyChanges.Count))</h3>
-$(if ($aggregatedEvents.AuditPolicyChanges.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.AuditPolicyChanges -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No audit policy changes in the last $EventLookbackHours hour(s).</em></p>" })
-<h3>Special Logons ($($aggregatedEvents.SpecialLogon.Count))</h3>
-$(if ($aggregatedEvents.SpecialLogon.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.SpecialLogon -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No special privilege logons in the last $EventLookbackHours hour(s).</em></p>" })
+$(if ($aggregatedEvents.PlannedRestart.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.PlannedRestart -Title "" } else { "<p><em>None</em></p>" })
 </div>
 </div>
 </div>
@@ -845,19 +1012,15 @@ $(if ($aggregatedEvents.SpecialLogon.Count -gt 0) { Format-EventTable -Events $a
 <h2>FSMO Role Holders</h2>
 <table>
 <thead><tr><th>Role</th><th>Holder</th><th>Status</th></tr></thead>
-<tbody>
-$fsmoHtml
-</tbody>
+<tbody>$fsmoHtml</tbody>
 </table>
 </div>
 
 <div class='panel'>
 <h2>Replication Failures</h2>
 <table>
-<thead><tr><th>Server</th><th>Partner</th><th>Last Error</th><th>Failure Count</th><th>First Failure</th><th>Last Failure</th></tr></thead>
-<tbody>
-$replFailHtml
-</tbody>
+<thead><tr><th>Server</th><th>Partner</th><th>Last Error</th><th>Count</th><th>First Failure</th><th>Last Failure</th></tr></thead>
+<tbody>$replFailHtml</tbody>
 </table>
 </div>
 
@@ -869,17 +1032,15 @@ $siteGroupHtml
 
 <div class='panel'>
 <h2>Privileged Group Membership</h2>
-<div class='meta'>First 50 entries shown. Full list saved to: $(HtmlSafe $groupCsv) &nbsp;|&nbsp; Total members: $($memberRows.Count)</div>
+<div class='meta'>Total members: $($memberRows.Count) (first 50 shown)</div>
 <table>
 <thead><tr><th>Group</th><th>Member Name</th><th>SAM Account</th><th>Type</th></tr></thead>
-<tbody>
-$privHtml
-</tbody>
+<tbody>$privHtml</tbody>
 </table>
 </div>
 
 <div class='panel'>
-<h2>Replication Summary (repadmin /replsummary)</h2>
+<h2>Replication Summary</h2>
 <pre>$(HtmlSafe $replText)</pre>
 </div>
 
@@ -894,10 +1055,6 @@ function filterDCs(val) {
     rows.forEach(function(r) {
         var sd = r.getAttribute('data-search') || '';
         r.style.display = lower === '' ? '' : (sd.indexOf(lower) > -1 ? '' : 'none');
-    });
-    var tables = document.querySelectorAll('.site-table');
-    tables.forEach(function(t) {
-        if (lower !== '') { t.style.display = ''; }
     });
 }
 function showTab(tabName) {
@@ -923,44 +1080,6 @@ function showTab(tabName) {
 
 #endregion HTML Template
 
-#region JSON Output
-
-$payload = [pscustomobject]@{
-    GeneratedOn            = (Get-Date).ToString('s')
-    EventLookbackHours     = $EventLookbackHours
-    Domain                 = [string]$domain.DNSRoot
-    Forest                 = [string]$forest.Name
-    HealthStatus           = $healthStatus
-    EscalationGuidance     = $escalationGuidance
-    DomainControllerCount  = $dcRows.Count
-    SiteCount              = $siteStats.Count
-    ReachableCount         = $reachableCount
-    UnreachableCount       = $unreachableCount
-    ServiceIssueCount      = $issueRows.Count
-    ReplicationFailures    = $replIssueCount
-    FsmoIssues             = $fsmoDown
-    TotalSecurityEvents    = $totalEventsFound
-    SiteStats              = @($siteStats)
-    DomainControllers      = @($dcRows | Select-Object -ExcludeProperty Events)
-    FsmoRoles              = @($fsmoRows)
-    ReplicationFailureRows = @($replFailureRows)
-    PrivilegedGroupMembers = @($memberRows)
-    ReplicationSummaryText = $replText
-    EventSummary = @{
-        AccountLockouts      = $aggregatedEvents.AccountLockouts.Count
-        FailedLogons         = $aggregatedEvents.FailedLogons.Count
-        SuccessfulLogons     = $aggregatedEvents.SuccessfulLogons.Count
-        UserAccountChanges   = $aggregatedEvents.UserAccountChanges.Count
-        GroupMembershipChanges = $aggregatedEvents.GroupMembershipChanges.Count
-        UnexpectedShutdown   = $aggregatedEvents.UnexpectedShutdown.Count
-        SpecialLogon         = $aggregatedEvents.SpecialLogon.Count
-    }
-    DCsWithEventErrors = @($dcsWithEventErrors)
-}
-$payload | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonPath -Encoding UTF8
-
-#endregion JSON Output
-
 #region Final Output
 
 Write-Log "=========================================" -Level OK
@@ -971,13 +1090,6 @@ Write-Log ("CSV  : {0}" -f $dcCsv) -Level OK
 Write-Log ("CSV  : {0}" -f $groupCsv) -Level OK
 Write-Log ("CSV  : {0}" -f $eventsCsv) -Level OK
 Write-Log ("JSON : {0}" -f $jsonPath) -Level OK
-Write-Log "=========================================" -Level OK
-Write-Log "Event Summary (last $EventLookbackHours hour(s)):" -Level OK
-Write-Log ("  - Account Lockouts   : {0}" -f $aggregatedEvents.AccountLockouts.Count)
-Write-Log ("  - Failed Logons      : {0}" -f $aggregatedEvents.FailedLogons.Count)
-Write-Log ("  - Successful Logons  : {0}" -f $aggregatedEvents.SuccessfulLogons.Count)
-Write-Log ("  - Group Changes      : {0}" -f $aggregatedEvents.GroupMembershipChanges.Count)
-Write-Log ("  - Unexpected Shutdown: {0}" -f $aggregatedEvents.UnexpectedShutdown.Count)
 Write-Log "=========================================" -Level OK
 
 [pscustomobject]@{
