@@ -574,3 +574,12 @@ Write-Log ("JSON : {0}" -f $jsonPath) -Level OK
     GroupCsv   = $groupCsv
     JsonReport = $jsonPath
 }
+
+
+
+DC's should Enumerates Domain to Domain.
+We can remove Groupmemebrship focused.
+Disabled User list not needed from the script
+Need to change the Event logs window to 1hr.
+Need to Add Event ID, which server rebooted abruptly(Event ID: 7, 6008)
+Segregate the Codes in script Function wise.
