@@ -1,854 +1,512 @@
-[CmdletBinding()]
-param(
-    [string]$OutputDirectory = "C:\Temp\AD_Daily_Health",
-    [bool]$IncludeReplicationText = $true,
-    [switch]$Runbook,
-    [switch]$DemoMode,
-    [ValidateRange(1, 25)]
-    [int]$DemoDomainControllerLimit = 3,
-    [ValidateRange(1, 50)]
-    [int]$MaxConcurrency = 25,
-    [ValidateRange(1, 24)]
-    [int]$EventLookbackHours = 1
-)
-
-$ErrorActionPreference = 'Continue'  # Changed to Continue to handle errors gracefully
-Set-StrictMode -Version 2.0
-
-#region Functions
-
-function Write-Log {
-    param(
-        [string]$Message,
-        [string]$Level = 'INFO'
-    )
-    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $color = switch ($Level) {
-        'ERROR' { 'Red' }
-        'WARN'  { 'Yellow' }
-        'OK'    { 'Green' }
-        default { 'White' }
-    }
-    Write-Host "[$ts] [$Level] $Message" -ForegroundColor $color
-}
-
-function HtmlSafe {
-    param([object]$Value)
-    if ($null -eq $Value) { return '' }
-    return [System.Net.WebUtility]::HtmlEncode([string]$Value)
-}
-
-function Get-SvcBadge {
-    param([string]$Status)
-    $cls = if ($Status -eq 'Running') { 'svc-ok' } 
-           elseif ($Status -eq 'Unknown') { 'svc-unk' } 
-           else { 'svc-bad' }
-    return "<span class='svc $cls'>$(HtmlSafe $Status)</span>"
-}
-
-function Test-Port {
-    param(
-        [string]$ComputerName,
-        [int]$Port,
-        [int]$TimeoutMs = 1000
-    )
-    try {
-        $tcpClient = New-Object System.Net.Sockets.TcpClient
-        $asyncResult = $tcpClient.BeginConnect($ComputerName, $Port, $null, $null)
-        $wait = $asyncResult.AsyncWaitHandle.WaitOne($TimeoutMs)
-        if ($wait) {
-            $tcpClient.EndConnect($asyncResult)
-            $tcpClient.Close()
-            return $true
-        }
-        else {
-            $tcpClient.Close()
-            return $false
-        }
-    }
-    catch {
-        return $false
-    }
-}
-
-function Get-DCServicesStatus {
-    param(
-        [string]$ComputerName,
-        [int]$PortCheckTimeoutMs = 2000
-    )
-    
-    $requiredPorts = @{
-        "LDAP" = 389
-        "LDAPS" = 636
-        "Kerberos" = 88
-        "DNS" = 53
-        "NetLogon" = 445
-        "SMB" = 445
-        "WinRM" = 5985
-    }
-    
-    $portStatus = @{}
-    foreach ($portName in $requiredPorts.Keys) {
-        $portStatus[$portName] = Test-Port -ComputerName $ComputerName -Port $requiredPorts[$portName] -TimeoutMs $PortCheckTimeoutMs
-    }
-    
-    $services = @{ NTDS = 'Unknown'; Netlogon = 'Unknown'; KDC = 'Unknown'; DFSR = 'Unknown'; DNS = 'Unknown' }
-    $serviceError = $null
-    $winrmAvailable = $portStatus["WinRM"]
-    
-    if ($winrmAvailable) {
-        try {
-            $svcNames = @('NTDS', 'Netlogon', 'KDC', 'DFSR', 'DNS')
-            foreach ($svc in $svcNames) {
-                try {
-                    $svcResult = Get-Service -ComputerName $ComputerName -Name $svc -ErrorAction Stop
-                    $services[$svc] = $svcResult.Status.ToString()
-                }
-                catch {
-                    $services[$svc] = 'Not Found'
-                }
-            }
-        }
-        catch {
-            $serviceError = "WinRM query failed"
-        }
-    }
-    
-    # Fallback to port-based detection
-    if ($services.Values | Where-Object { $_ -eq 'Unknown' -or $_ -eq 'Not Found' }) {
-        if ($portStatus["LDAP"] -and $portStatus["Kerberos"]) {
-            if ($services["NTDS"] -eq 'Unknown') { $services["NTDS"] = 'Running' }
-            if ($services["KDC"] -eq 'Unknown') { $services["KDC"] = 'Running' }
-        }
-        if ($portStatus["NetLogon"] -or $portStatus["SMB"]) {
-            if ($services["Netlogon"] -eq 'Unknown') { $services["Netlogon"] = 'Running' }
-        }
-        if ($portStatus["DNS"]) {
-            if ($services["DNS"] -eq 'Unknown') { $services["DNS"] = 'Running' }
-        }
-        if ($services["DFSR"] -eq 'Unknown') { $services["DFSR"] = 'Unknown' }
-    }
-    
-    return @{
-        Services = $services
-        Ports = $portStatus
-        Error = $serviceError
-        WinRMAvailable = $winrmAvailable
-    }
-}
-
-# Event log collection function (self-contained for remote execution)
-$getDCEventLogsScriptBlock = {
-    param($ComputerName, $StartTime, $TimeoutSeconds)
-    
-    $result = [pscustomobject]@{
-        ComputerName = $ComputerName
-        Success = $false
-        ErrorMessage = $null
-        AccountLockouts = @()
-        SuccessfulLogons = @()
-        Logoffs = @()
-        FailedLogons = @()
-        UserAccountChanges = @()
-        PasswordChanges = @()
-        GroupMembershipChanges = @()
-        ADObjectChanges = @()
-        AuditPolicyChanges = @()
-        SpecialLogon = @()
-        ExplicitCredentialLogon = @()
-        AccountUnlocked = @()
-        UnexpectedShutdown = @()
-        PlannedRestart = @()
-        EventLogShutdown = @()
-        TotalEventsFound = 0
-    }
-    
-    try {
-        $eventIds = @{
-            AccountLockouts = 4740
-            SuccessfulLogons = 4624
-            Logoffs = @(4634, 4647)
-            FailedLogons = 4625
-            UserAccountChanges = @(4720, 4722, 4725, 4738)
-            PasswordChanges = @(4723, 4724)
-            GroupMembershipChanges = @(4728, 4732, 4756)
-            ADObjectChanges = @(5136, 5137, 5138, 5139)
-            AuditPolicyChanges = 4719
-            SpecialLogon = 4672
-            ExplicitCredentialLogon = 4648
-            AccountUnlocked = 4767
-            UnexpectedShutdown = @(41, 6008)
-            PlannedRestart = 1074
-            EventLogShutdown = 1100
-        }
-        
-        $allIds = $eventIds.Values | ForEach-Object { $_ } | Sort-Object -Unique
-        
-        try {
-            $filterHash = @{LogName='Security'; StartTime=$StartTime; ID=$allIds}
-            $secEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable $filterHash -ErrorAction Stop -MaxEvents 5000
-            
-            $filterHash = @{LogName='System'; StartTime=$StartTime; ID=$eventIds.UnexpectedShutdown + $eventIds.PlannedRestart + $eventIds.EventLogShutdown}
-            $sysEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable $filterHash -ErrorAction SilentlyContinue -MaxEvents 1000
-            
-            $allEvents = @($secEvents) + @($sysEvents)
-        }
-        catch {
-            $allEvents = @()
-            $result.ErrorMessage = $_.Exception.Message
-        }
-        
-        $resultObj = @{
-            AccountLockouts = @()
-            SuccessfulLogons = @()
-            Logoffs = @()
-            FailedLogons = @()
-            UserAccountChanges = @()
-            PasswordChanges = @()
-            GroupMembershipChanges = @()
-            ADObjectChanges = @()
-            AuditPolicyChanges = @()
-            SpecialLogon = @()
-            ExplicitCredentialLogon = @()
-            AccountUnlocked = @()
-            UnexpectedShutdown = @()
-            PlannedRestart = @()
-            EventLogShutdown = @()
-            TotalEventsFound = 0
-        }
-        
-        foreach ($evt in $allEvents) {
-            $evtTime = $evt.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
-            $evtId = $evt.Id
-            $message = ($evt.Message -replace "`n", ' ' -replace "`r", ' ' -replace ',', ';')
-            $shortMsg = if ($message.Length -gt 200) { $message.Substring(0, 197) + '...' } else { $message }
-            
-            $eventObj = @{
-                Time = $evtTime
-                Id = $evtId
-                Message = $shortMsg
-            }
-            
-            switch ($evtId) {
-                4740 { $resultObj.AccountLockouts += $eventObj }
-                4624 { $resultObj.SuccessfulLogons += $eventObj }
-                4634 { $resultObj.Logoffs += $eventObj }
-                4647 { $resultObj.Logoffs += $eventObj }
-                4625 { $resultObj.FailedLogons += $eventObj }
-                4720 { $resultObj.UserAccountChanges += $eventObj }
-                4722 { $resultObj.UserAccountChanges += $eventObj }
-                4725 { $resultObj.UserAccountChanges += $eventObj }
-                4738 { $resultObj.UserAccountChanges += $eventObj }
-                4723 { $resultObj.PasswordChanges += $eventObj }
-                4724 { $resultObj.PasswordChanges += $eventObj }
-                4728 { $resultObj.GroupMembershipChanges += $eventObj }
-                4732 { $resultObj.GroupMembershipChanges += $eventObj }
-                4756 { $resultObj.GroupMembershipChanges += $eventObj }
-                5136 { $resultObj.ADObjectChanges += $eventObj }
-                5137 { $resultObj.ADObjectChanges += $eventObj }
-                5138 { $resultObj.ADObjectChanges += $eventObj }
-                5139 { $resultObj.ADObjectChanges += $eventObj }
-                4719 { $resultObj.AuditPolicyChanges += $eventObj }
-                4672 { $resultObj.SpecialLogon += $eventObj }
-                4648 { $resultObj.ExplicitCredentialLogon += $eventObj }
-                4767 { $resultObj.AccountUnlocked += $eventObj }
-                41   { $resultObj.UnexpectedShutdown += $eventObj }
-                6008 { $resultObj.UnexpectedShutdown += $eventObj }
-                1074 { $resultObj.PlannedRestart += $eventObj }
-                1100 { $resultObj.EventLogShutdown += $eventObj }
-            }
-            $resultObj.TotalEventsFound++
-        }
-        
-        $result.Success = $true
-        $result.AccountLockouts = $resultObj.AccountLockouts
-        $result.SuccessfulLogons = $resultObj.SuccessfulLogons
-        $result.Logoffs = $resultObj.Logoffs
-        $result.FailedLogons = $resultObj.FailedLogons
-        $result.UserAccountChanges = $resultObj.UserAccountChanges
-        $result.PasswordChanges = $resultObj.PasswordChanges
-        $result.GroupMembershipChanges = $resultObj.GroupMembershipChanges
-        $result.ADObjectChanges = $resultObj.ADObjectChanges
-        $result.AuditPolicyChanges = $resultObj.AuditPolicyChanges
-        $result.SpecialLogon = $resultObj.SpecialLogon
-        $result.ExplicitCredentialLogon = $resultObj.ExplicitCredentialLogon
-        $result.AccountUnlocked = $resultObj.AccountUnlocked
-        $result.UnexpectedShutdown = $resultObj.UnexpectedShutdown
-        $result.PlannedRestart = $resultObj.PlannedRestart
-        $result.EventLogShutdown = $resultObj.EventLogShutdown
-        $result.TotalEventsFound = $resultObj.TotalEventsFound
-    }
-    catch {
-        $result.ErrorMessage = $_.Exception.Message
-    }
-    
-    return $result
-}
-
-# DC health check script (self-contained with all functions)
-$dcCheckScriptBlock = {
-    param([string]$HostName, [string]$Domain, [string]$Site, [string]$IPv4, [datetime]$EventStartTime, [int]$EventTimeout, [scriptblock]$EventLogScript)
-    
-    # Helper functions for this script block
-    function Test-PortLocal {
-        param($ComputerName, $Port, $TimeoutMs = 1000)
-        try {
-            $tcpClient = New-Object System.Net.Sockets.TcpClient
-            $asyncResult = $tcpClient.BeginConnect($ComputerName, $Port, $null, $null)
-            $wait = $asyncResult.AsyncWaitHandle.WaitOne($TimeoutMs)
-            if ($wait) {
-                $tcpClient.EndConnect($asyncResult)
-                $tcpClient.Close()
-                return $true
-            }
-            $tcpClient.Close()
-            return $false
-        }
-        catch { return $false }
-    }
-    
-    function Get-DCServicesStatusLocal {
-        param($ComputerName, $PortCheckTimeoutMs = 2000)
-        
-        $requiredPorts = @{"LDAP"=389;"Kerberos"=88;"DNS"=53;"NetLogon"=445;"WinRM"=5985}
-        $portStatus = @{}
-        foreach ($portName in $requiredPorts.Keys) {
-            $portStatus[$portName] = Test-PortLocal -ComputerName $ComputerName -Port $requiredPorts[$portName] -TimeoutMs $PortCheckTimeoutMs
-        }
-        
-        $services = @{ NTDS = 'Unknown'; Netlogon = 'Unknown'; KDC = 'Unknown'; DFSR = 'Unknown'; DNS = 'Unknown' }
-        $winrmAvailable = $portStatus["WinRM"]
-        
-        if ($winrmAvailable) {
-            try {
-                $svcNames = @('NTDS', 'Netlogon', 'KDC', 'DFSR', 'DNS')
-                foreach ($svc in $svcNames) {
-                    try {
-                        $svcResult = Get-Service -ComputerName $ComputerName -Name $svc -ErrorAction Stop
-                        $services[$svc] = $svcResult.Status.ToString()
-                    }
-                    catch { $services[$svc] = 'Not Found' }
-                }
-            }
-            catch {}
-        }
-        
-        # Fallback to port-based detection
-        if ($services.Values | Where-Object { $_ -eq 'Unknown' -or $_ -eq 'Not Found' }) {
-            if ($portStatus["LDAP"] -and $portStatus["Kerberos"]) {
-                if ($services["NTDS"] -eq 'Unknown') { $services["NTDS"] = 'Running' }
-                if ($services["KDC"] -eq 'Unknown') { $services["KDC"] = 'Running' }
-            }
-            if ($portStatus["NetLogon"]) {
-                if ($services["Netlogon"] -eq 'Unknown') { $services["Netlogon"] = 'Running' }
-            }
-            if ($portStatus["DNS"]) {
-                if ($services["DNS"] -eq 'Unknown') { $services["DNS"] = 'Running' }
-            }
-        }
-        
-        return @{ Services = $services; Ports = $portStatus; WinRMAvailable = $winrmAvailable }
-    }
-    
-    # Check reachability
-    $reachable = $false
-    $pingLatencyMs = $null
-    try { 
-        $ping = Test-Connection -ComputerName $HostName -Count 1 -Quiet -ErrorAction Stop
-        $reachable = $ping
-        if ($reachable) {
-            $pingDetail = Test-Connection -ComputerName $HostName -Count 1 -ErrorAction SilentlyContinue
-            if ($pingDetail) { $pingLatencyMs = [int]$pingDetail.ResponseTime }
-        }
-    }
-    catch { $reachable = $false }
-    
-    $services = @{ NTDS = 'Unknown'; Netlogon = 'Unknown'; KDC = 'Unknown'; DFSR = 'Unknown'; DNS = 'Unknown' }
-    $portStatus = @{}
-    $winrmAvailable = $false
-    
-    if ($reachable) {
-        $svcStatus = Get-DCServicesStatusLocal -ComputerName $HostName
-        $services = $svcStatus.Services
-        $portStatus = $svcStatus.Ports
-        $winrmAvailable = $svcStatus.WinRMAvailable
-    }
-    
-    $anyBad = @($services.Values | Where-Object { $_ -notin @('Running', 'Unknown') })
-    $dcStatus = if (-not $reachable) { 'Red' } elseif ($anyBad.Count -gt 0) { 'Yellow' } else { 'Green' }
-    
-    # Get events
-    $events = $null
-    if ($reachable -and $EventLogScript) {
-        try {
-            $events = & $EventLogScript -ComputerName $HostName -StartTime $EventStartTime -TimeoutSeconds $EventTimeout
-        }
-        catch {
-            $events = [pscustomobject]@{ Success = $false; ErrorMessage = $_.Exception.Message; TotalEventsFound = 0 }
-        }
-    }
-    elseif ($reachable) {
-        $events = [pscustomobject]@{ Success = $false; ErrorMessage = "Event log script not available"; TotalEventsFound = 0 }
-    }
-    
-    [pscustomobject]@{
-        Domain          = $Domain
-        HostName        = $HostName
-        Site            = $Site
-        IPv4Address     = $IPv4
-        Reachable       = $reachable
-        PingLatencyMs   = $pingLatencyMs
-        NTDS            = $services['NTDS']
-        Netlogon        = $services['Netlogon']
-        KDC             = $services['KDC']
-        DFSR            = $services['DFSR']
-        DNS             = $services['DNS']
-        WinRMAvailable  = $winrmAvailable
-        PortLDAP        = if ($portStatus.ContainsKey('LDAP')) { $portStatus['LDAP'] } else { $false }
-        PortKerberos    = if ($portStatus.ContainsKey('Kerberos')) { $portStatus['Kerberos'] } else { $false }
-        PortDNS         = if ($portStatus.ContainsKey('DNS')) { $portStatus['DNS'] } else { $false }
-        PortSMB         = if ($portStatus.ContainsKey('NetLogon')) { $portStatus['NetLogon'] } else { $false }
-        DcStatus        = $dcStatus
-        Events          = $events
-    }
-}
-
-function Write-HealthRunbook {
-    $lines = @(
-        'AD Daily Health Summary Runbook',
-        '',
-        'Required Ports for DC Communication:',
-        '  - LDAP: 389, LDAPS: 636',
-        '  - Global Catalog: 3268, 3269',
-        '  - Kerberos: 88, 464',
-        '  - DNS: 53',
-        '  - NetLogon/SMB: 445',
-        '  - WinRM: 5985 (HTTP), 5986 (HTTPS)',
-        '',
-        'Standard daily run:',
-        'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1',
-        '',
-        'Large environment with 200+ DCs:',
-        'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -MaxConcurrency 30',
-        '',
-        'Print this runbook only:',
-        'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -Runbook'
-    )
-    Write-Host ($lines -join [Environment]::NewLine)
-}
-
-#endregion Functions
-
-if ($Runbook) {
-    Write-HealthRunbook
-    return
-}
-
-#region Initialization
-
-if (-not (Test-Path -LiteralPath $OutputDirectory)) {
-    New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-}
-
-Write-Log 'Loading ActiveDirectory module...'
-Import-Module ActiveDirectory -ErrorAction Stop
-
-$eventStartTime = (Get-Date).AddHours(-$EventLookbackHours)
-Write-Log "Collecting events from last $EventLookbackHours hour(s) (since $eventStartTime)"
-
-$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$domain = Get-ADDomain
-$forest = Get-ADForest
-$dcs = @(Get-ADDomainController -Filter *)
-
-if ($DemoMode -and $dcs.Count -gt $DemoDomainControllerLimit) {
-    $dcs = @($dcs | Sort-Object HostName | Select-Object -First $DemoDomainControllerLimit)
-    Write-Log ("Demo mode: limited to first {0} domain controllers." -f $DemoDomainControllerLimit)
-}
-
-#endregion Initialization
-
-#region Parallel DC Health & Event Collection
-
-Write-Log ("Starting parallel health and event collection: {0} DCs, max concurrency {1}..." -f $dcs.Count, $MaxConcurrency)
-
-$pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $MaxConcurrency)
-$pool.Open()
-
-$jobs = @()
-foreach ($dc in $dcs) {
-    $ps = [System.Management.Automation.PowerShell]::Create()
-    $ps.RunspacePool = $pool
-    [void]$ps.AddScript($dcCheckScriptBlock.ToString())
-    [void]$ps.AddArgument([string]$dc.HostName)
-    [void]$ps.AddArgument([string]$dc.Domain)
-    [void]$ps.AddArgument([string]$dc.Site)
-    [void]$ps.AddArgument([string]$dc.IPv4Address)
-    [void]$ps.AddArgument([datetime]$eventStartTime)
-    [void]$ps.AddArgument(60)
-    [void]$ps.AddArgument([scriptblock]$getDCEventLogsScriptBlock)
-    $jobs += [pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke(); HostName = $dc.HostName }
-}
-
-$dcRows = @()
-$allEventData = @()
-$done = 0
-foreach ($job in $jobs) {
-    try {
-        $result = $job.PS.EndInvoke($job.Handle)
-        if ($null -ne $result) { 
-            $dcRows += $result
-            if ($result.Events -and $result.Events.Success) {
-                $allEventData += $result.Events
-            }
-            elseif ($result.Events) {
-                Write-Log ("WARN: Event collection failed for {0}: {1}" -f $result.HostName, $result.Events.ErrorMessage) -Level WARN
-            }
-        }
-    }
-    catch {
-        Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, $_.Exception.Message) -Level ERROR
-    }
-    finally {
-        $job.PS.Dispose()
-    }
-    $done++
-    if ($done % 10 -eq 0 -or $done -eq $jobs.Count) {
-        Write-Log ("Progress: {0}/{1} DCs collected." -f $done, $jobs.Count)
-    }
-}
-
-$pool.Close()
-$pool.Dispose()
-Write-Log ("Parallel collection complete. {0} results." -f $dcRows.Count)
-
-# Count DCs with service detection issues
-$dcsWithServiceIssues = @($dcRows | Where-Object { 
-    $_.NTDS -eq 'Unavailable' -or $_.NTDS -eq 'Unknown' -or 
-    $_.Netlogon -eq 'Unavailable' -or $_.Netlogon -eq 'Unknown'
-})
-Write-Log ("DCs with potential service detection issues: {0}" -f $dcsWithServiceIssues.Count) -Level WARN
-
-# Aggregate events across all DCs
-$aggregatedEvents = @{
-    AccountLockouts = @()
-    SuccessfulLogons = @()
-    Logoffs = @()
-    FailedLogons = @()
-    UserAccountChanges = @()
-    PasswordChanges = @()
-    GroupMembershipChanges = @()
-    ADObjectChanges = @()
-    AuditPolicyChanges = @()
-    SpecialLogon = @()
-    ExplicitCredentialLogon = @()
-    AccountUnlocked = @()
-    UnexpectedShutdown = @()
-    PlannedRestart = @()
-    EventLogShutdown = @()
-}
-
-$totalEventsFound = 0
-$dcsWithEventErrors = @()
-
-foreach ($eventData in $allEventData) {
-    if (-not $eventData.Success) {
-        $dcsWithEventErrors += [pscustomobject]@{
-            DC = $eventData.ComputerName
-            Error = $eventData.ErrorMessage
-        }
-    }
-    else {
-        $totalEventsFound += $eventData.TotalEventsFound
-        $aggregatedEvents.AccountLockouts += $eventData.AccountLockouts
-        $aggregatedEvents.SuccessfulLogons += $eventData.SuccessfulLogons
-        $aggregatedEvents.Logoffs += $eventData.Logoffs
-        $aggregatedEvents.FailedLogons += $eventData.FailedLogons
-        $aggregatedEvents.UserAccountChanges += $eventData.UserAccountChanges
-        $aggregatedEvents.PasswordChanges += $eventData.PasswordChanges
-        $aggregatedEvents.GroupMembershipChanges += $eventData.GroupMembershipChanges
-        $aggregatedEvents.ADObjectChanges += $eventData.ADObjectChanges
-        $aggregatedEvents.AuditPolicyChanges += $eventData.AuditPolicyChanges
-        $aggregatedEvents.SpecialLogon += $eventData.SpecialLogon
-        $aggregatedEvents.ExplicitCredentialLogon += $eventData.ExplicitCredentialLogon
-        $aggregatedEvents.AccountUnlocked += $eventData.AccountUnlocked
-        $aggregatedEvents.UnexpectedShutdown += $eventData.UnexpectedShutdown
-        $aggregatedEvents.PlannedRestart += $eventData.PlannedRestart
-        $aggregatedEvents.EventLogShutdown += $eventData.EventLogShutdown
-    }
-}
-
-Write-Log "Total security/audit events collected: $totalEventsFound"
-
-#endregion Parallel DC Health & Event Collection
-
-#region AD Data Collection (FSMO, Replication, Groups)
-
-$fsmoMap = [ordered]@{
-    PDCEmulator          = [string]$domain.PDCEmulator
-    RIDMaster            = [string]$domain.RIDMaster
-    InfrastructureMaster = [string]$domain.InfrastructureMaster
-    SchemaMaster         = [string]$forest.SchemaMaster
-    DomainNamingMaster   = [string]$forest.DomainNamingMaster
-}
-
-$fsmoRows = @()
-foreach ($role in $fsmoMap.GetEnumerator()) {
-    $ok = $false
-    try { $ok = [bool](Test-Connection -ComputerName $role.Value -Count 1 -Quiet -ErrorAction Stop) } catch {}
-    $fsmoRows += [pscustomobject]@{ Role = $role.Key; Holder = $role.Value; Reachable = $ok }
-}
-
-$replFailureRows = @()
-try {
-    $replFailures = @(Get-ADReplicationFailure -Scope Forest -ErrorAction Stop)
-    foreach ($f in $replFailures) {
-        $replFailureRows += [pscustomobject]@{
-            Server           = [string]$f.Server
-            Partner          = [string]$f.Partner
-            LastError        = [string]$f.LastError
-            FailureCount     = [int]$f.FailureCount
-            FirstFailureTime = $f.FirstFailureTime
-            LastFailureTime  = $f.LastFailureTime
-        }
-    }
-}
-catch { Write-Log ("Get-ADReplicationFailure: {0}" -f $_.Exception.Message) -Level WARN }
-
-$replText = ''
-if ($IncludeReplicationText -and (Get-Command repadmin.exe -ErrorAction SilentlyContinue)) {
-    try { $replText = (& repadmin.exe /replsummary | Out-String) }
-    catch { $replText = "repadmin failed: $($_.Exception.Message)" }
-}
-
-$privGroups = @('Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Administrators', 'DNSAdmins')
-$memberRows = @()
-foreach ($group in $privGroups) {
-    try {
-        $members = @(Get-ADGroupMember -Identity $group -Recursive -ErrorAction Stop)
-        foreach ($m in $members) {
-            $memberRows += [pscustomobject]@{
-                PrivilegedGroup   = $group
-                MemberName        = [string]$m.Name
-                MemberSam         = [string]$m.SamAccountName
-                MemberClass       = [string]$m.objectClass
-                DistinguishedName = [string]$m.DistinguishedName
-            }
-        }
-    }
-    catch {
-        $memberRows += [pscustomobject]@{
-            PrivilegedGroup   = $group; MemberName = ''; MemberSam = ''
-            MemberClass       = 'Error'; DistinguishedName = $_.Exception.Message
-        }
-    }
-}
-
-#endregion AD Data Collection
-
-#region Health Scoring
-
-$reachableCount   = @($dcRows | Where-Object { $_.Reachable }).Count
-$unreachableCount = @($dcRows | Where-Object { -not $_.Reachable }).Count
-$issueRows        = @($dcRows | Where-Object { $_.DcStatus -ne 'Green' })
-$fsmoDown         = @($fsmoRows | Where-Object { -not $_.Reachable }).Count
-$replIssueCount   = $replFailureRows.Count
-
-$hasCriticalEvents = ($aggregatedEvents.AccountLockouts.Count + 
-                      $aggregatedEvents.FailedLogons.Count + 
-                      $aggregatedEvents.GroupMembershipChanges.Count + 
-                      $aggregatedEvents.UnexpectedShutdown.Count) -gt 0
-
-$healthStatus = if ($unreachableCount -gt 0 -or $fsmoDown -gt 0) { 'Red' }
-               elseif ($issueRows.Count -gt 0 -or $replIssueCount -gt 0 -or $hasCriticalEvents) { 'Yellow' }
-               else { 'Green' }
-
-$escalationGuidance = switch ($healthStatus) {
-    'Red'    { 'IMMEDIATE ACTION: One or more domain controllers or FSMO role holders are unreachable.' }
-    'Yellow' { 'ATTENTION: Service degradation, replication failures, or critical security events detected.' }
-    default  { 'All domain controllers and FSMO role holders are healthy.' }
-}
-
-$siteStats = @($dcRows | Group-Object -Property Site | ForEach-Object {
-    $sg     = @($_.Group)
-    $sRed   = @($sg | Where-Object { $_.DcStatus -eq 'Red'    }).Count
-    $sYel   = @($sg | Where-Object { $_.DcStatus -eq 'Yellow' }).Count
-    $sGrn   = @($sg | Where-Object { $_.DcStatus -eq 'Green'  }).Count
-    $sColor = if ($sRed -gt 0) { 'red' } elseif ($sYel -gt 0) { 'yellow' } else { 'green' }
-    [pscustomobject]@{
-        Site   = [string]$_.Name
-        Total  = $sg.Count
-        Red    = $sRed
-        Yellow = $sYel
-        Green  = $sGrn
-        Color  = $sColor
-    }
-} | Sort-Object Color, Site)
-
-#endregion Health Scoring
-
-#region Output Files
-
-$htmlPath = Join-Path $OutputDirectory ("AD_Daily_Health_Summary_{0}.html" -f $stamp)
-$dcCsv    = Join-Path $OutputDirectory ("AD_Daily_Health_DCs_{0}.csv"     -f $stamp)
-$groupCsv = Join-Path $OutputDirectory ("AD_Daily_Health_Groups_{0}.csv"  -f $stamp)
-$eventsCsv = Join-Path $OutputDirectory ("AD_Daily_Health_Events_{0}.csv"  -f $stamp)
-$jsonPath = Join-Path $OutputDirectory ("AD_Daily_Health_Summary_{0}.json" -f $stamp)
-
-$dcRows | Export-Csv -Path $dcCsv -NoTypeInformation -Encoding UTF8
-$memberRows | Export-Csv -Path $groupCsv -NoTypeInformation -Encoding UTF8
-
-# Export all events to CSV
-$allEventsExport = @()
-foreach ($evtData in $allEventData) {
-    if ($evtData.Success) {
-        foreach ($evt in $evtData.AccountLockouts) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.SuccessfulLogons) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.Logoffs) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.FailedLogons) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.UserAccountChanges) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.PasswordChanges) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.GroupMembershipChanges) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.ADObjectChanges) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.AuditPolicyChanges) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.SpecialLogon) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.ExplicitCredentialLogon) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.AccountUnlocked) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.UnexpectedShutdown) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.PlannedRestart) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-        foreach ($evt in $evtData.EventLogShutdown) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
-    }
-}
-$allEventsExport | Export-Csv -Path $eventsCsv -NoTypeInformation -Encoding UTF8
-
-#endregion Output Files
-
-#region Simple HTML Output
-
-$html = @"
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset='UTF-8'>
-<title>AD Daily Health Summary</title>
-<style>
-body { font-family: Arial, sans-serif; margin: 20px; }
-table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
-th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-th { background-color: #4CAF50; color: white; }
-tr:nth-child(even) { background-color: #f2f2f2; }
-.green { background-color: #d4edda; }
-.yellow { background-color: #fff3cd; }
-.red { background-color: #f8d7da; }
-.card { display: inline-block; margin: 10px; padding: 15px; border: 1px solid #ddd; border-radius: 5px; min-width: 150px; }
-</style>
-</head>
-<body>
-<h1>AD Daily Health Summary</h1>
-<p>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
-<p>Domain: $($domain.DNSRoot) | Forest: $($forest.Name) | DCs: $($dcRows.Count)</p>
-
-<h2>Overall Health: <span class='$healthLower'>$healthStatus</span></h2>
-<p>$escalationGuidance</p>
-
-<h2>DC Health Summary</h2>
-<table>
-<tr><th>HostName</th><th>Site</th><th>Reachable</th><th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DNS</th><th>Status</th></tr>
-$(
-    foreach ($dc in $dcRows) {
-        $rowClass = switch ($dc.DcStatus) { 'Red' { 'red' } 'Yellow' { 'yellow' } default { 'green' } }
-        "<tr class='$rowClass'>" +
-        "<td>$($dc.HostName)</td>" +
-        "<td>$($dc.Site)</td>" +
-        "<td>$($dc.Reachable)</td>" +
-        "<td>$($dc.NTDS)</td>" +
-        "<td>$($dc.Netlogon)</td>" +
-        "<td>$($dc.KDC)</td>" +
-        "<td>$($dc.DNS)</td>" +
-        "<td>$($dc.DcStatus)</td></tr>"
-    }
-)
-</table>
-
-<h2>Event Summary (Last $EventLookbackHours hours)</h2>
-<table>
-<tr><th>Event Type</th><th>Count</th></tr>
-<tr><td>Account Lockouts</td><td>$($aggregatedEvents.AccountLockouts.Count)</td></tr>
-<tr><td>Failed Logons</td><td>$($aggregatedEvents.FailedLogons.Count)</td></tr>
-<tr><td>Group Changes</td><td>$($aggregatedEvents.GroupMembershipChanges.Count)</td></tr>
-<tr><td>Unexpected Shutdowns</td><td>$($aggregatedEvents.UnexpectedShutdown.Count)</td></tr>
-</table>
-
-<p><strong>Output Files:</strong></p>
-<ul>
-<li>HTML: $htmlPath</li>
-<li>DC CSV: $dcCsv</li>
-<li>Group CSV: $groupCsv</li>
-<li>Events CSV: $eventsCsv</li>
-<li>JSON: $jsonPath</li>
-</ul>
-</body>
-</html>
-"@
-
-[System.IO.File]::WriteAllText($htmlPath, $html, [System.Text.Encoding]::UTF8)
-
-#endregion Simple HTML Output
-
-#region JSON Output
-
-$payload = [pscustomobject]@{
-    GeneratedOn            = (Get-Date).ToString('s')
-    EventLookbackHours     = $EventLookbackHours
-    Domain                 = [string]$domain.DNSRoot
-    Forest                 = [string]$forest.Name
-    HealthStatus           = $healthStatus
-    EscalationGuidance     = $escalationGuidance
-    DomainControllerCount  = $dcRows.Count
-    ReachableCount         = $reachableCount
-    UnreachableCount       = $unreachableCount
-    ServiceIssueCount      = $issueRows.Count
-    ReplicationFailures    = $replIssueCount
-    FsmoIssues             = $fsmoDown
-    TotalSecurityEvents    = $totalEventsFound
-    DomainControllers      = @($dcRows | Select-Object -ExcludeProperty Events)
-    FsmoRoles              = @($fsmoRows)
-    EventSummary = @{
-        AccountLockouts      = $aggregatedEvents.AccountLockouts.Count
-        FailedLogons         = $aggregatedEvents.FailedLogons.Count
-        SuccessfulLogons     = $aggregatedEvents.SuccessfulLogons.Count
-        GroupMembershipChanges = $aggregatedEvents.GroupMembershipChanges.Count
-        UnexpectedShutdown   = $aggregatedEvents.UnexpectedShutdown.Count
-    }
-}
-$payload | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonPath -Encoding UTF8
-
-#endregion JSON Output
-
-#region Final Output
-
-Write-Log "=========================================" -Level OK
-Write-Log "AD Daily Health Summary Complete!" -Level OK
-Write-Log "=========================================" -Level OK
-Write-Log ("HTML : {0}" -f $htmlPath) -Level OK
-Write-Log ("CSV  : {0}" -f $dcCsv) -Level OK
-Write-Log ("CSV  : {0}" -f $groupCsv) -Level OK
-Write-Log ("CSV  : {0}" -f $eventsCsv) -Level OK
-Write-Log ("JSON : {0}" -f $jsonPath) -Level OK
-Write-Log "=========================================" -Level OK
-Write-Log "Event Summary (last $EventLookbackHours hour(s)):" -Level OK
-Write-Log ("  - Account Lockouts   : {0}" -f $aggregatedEvents.AccountLockouts.Count)
-Write-Log ("  - Failed Logons      : {0}" -f $aggregatedEvents.FailedLogons.Count)
-Write-Log ("  - Group Changes      : {0}" -f $aggregatedEvents.GroupMembershipChanges.Count)
-Write-Log ("  - Unexpected Shutdown: {0}" -f $aggregatedEvents.UnexpectedShutdown.Count)
-Write-Log "=========================================" -Level OK
-
-[pscustomobject]@{
-    HtmlReport = $htmlPath
-    DcCsv      = $dcCsv
-    GroupCsv   = $groupCsv
-    EventsCsv  = $eventsCsv
-    JsonReport = $jsonPath
-}
-
-#endregion Final Output
+Write-Log : 
+You cannot call a method on a null-valued expression.
+At line:513 char:9
++         $job.PS.Dispose()
++         ~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (:) [], RuntimeException
+    + FullyQualifiedErrorId : InvokeMethodOnNull
+ 
+Write-Log : 
+You cannot call a method on a null-valued expression.
+At line:513 char:9
++         $job.PS.Dispose()
++         ~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (:) [], RuntimeException
+    + FullyQualifiedErrorId : InvokeMethodOnNull
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:517 char:9
++         Write-Log ("Progress: {0}/{1} DCs collected." -f $done, $jobs ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:517 char:9
++         Write-Log ("Progress: {0}/{1} DCs collected." -f $done, $jobs ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:510 char:9
++         Write-Log ("ERROR collecting from {0}: {1}" -f $job.HostName, ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+You cannot call a method on a null-valued expression.
+At line:521 char:1
++ $pool.Close()
++ ~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (:) [], RuntimeException
+    + FullyQualifiedErrorId : InvokeMethodOnNull
+ 
+You cannot call a method on a null-valued expression.
+At line:522 char:1
++ $pool.Dispose()
++ ~~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (:) [], RuntimeException
+    + FullyQualifiedErrorId : InvokeMethodOnNull
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:523 char:1
++ Write-Log ("Parallel collection complete. {0} results." -f $dcRows.Co ...
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Where-Object : The term 'Where-Object' is not recognized as the name of a cmdlet, function, script file, or operable 
+program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:526 char:37
++ $dcsWithServiceIssues = @($dcRows | Where-Object {
++                                     ~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Where-Object:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:530 char:1
++ Write-Log ("DCs with potential service detection issues: {0}" -f $dcs ...
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:581 char:1
++ Write-Log "Total security/audit events collected: $totalEventsFound"
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:616 char:9
++ catch { Write-Log ("Get-ADReplicationFailure: {0}" -f $_.Exception.Me ...
++         ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Where-Object : The term 'Where-Object' is not recognized as the name of a cmdlet, function, script file, or operable 
+program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:651 char:33
++ $reachableCount   = @($dcRows | Where-Object { $_.Reachable }).Count
++                                 ~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Where-Object:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Where-Object : The term 'Where-Object' is not recognized as the name of a cmdlet, function, script file, or operable 
+program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:652 char:33
++ $unreachableCount = @($dcRows | Where-Object { -not $_.Reachable }).C ...
++                                 ~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Where-Object:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Where-Object : The term 'Where-Object' is not recognized as the name of a cmdlet, function, script file, or operable 
+program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:653 char:33
++ $issueRows        = @($dcRows | Where-Object { $_.DcStatus -ne 'Green ...
++                                 ~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Where-Object:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Where-Object : The term 'Where-Object' is not recognized as the name of a cmdlet, function, script file, or operable 
+program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:654 char:35
++ $fsmoDown         = @($fsmoRows | Where-Object { -not $_.Reachable }) ...
++                                   ~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Where-Object:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Group-Object : The term 'Group-Object' is not recognized as the name of a cmdlet, function, script file, or operable 
+program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:672 char:26
++ $siteStats = @($dcRows | Group-Object -Property Site | ForEach-Object ...
++                          ~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Group-Object:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Join-Path : The term 'Join-Path' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:692 char:13
++ $htmlPath = Join-Path $OutputDirectory ("AD_Daily_Health_Summary_{0}. ...
++             ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Join-Path:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Join-Path : The term 'Join-Path' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:693 char:13
++ $dcCsv    = Join-Path $OutputDirectory ("AD_Daily_Health_DCs_{0}.csv" ...
++             ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Join-Path:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Join-Path : The term 'Join-Path' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:694 char:13
++ $groupCsv = Join-Path $OutputDirectory ("AD_Daily_Health_Groups_{0}.c ...
++             ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Join-Path:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Join-Path : The term 'Join-Path' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:695 char:14
++ $eventsCsv = Join-Path $OutputDirectory ("AD_Daily_Health_Events_{0}. ...
++              ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Join-Path:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Join-Path : The term 'Join-Path' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:696 char:13
++ $jsonPath = Join-Path $OutputDirectory ("AD_Daily_Health_Summary_{0}. ...
++             ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Join-Path:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Export-Csv : The term 'Export-Csv' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:698 char:11
++ $dcRows | Export-Csv -Path $dcCsv -NoTypeInformation -Encoding UTF8
++           ~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Export-Csv:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Export-Csv : The term 'Export-Csv' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:699 char:15
++ $memberRows | Export-Csv -Path $groupCsv -NoTypeInformation -Encoding ...
++               ~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Export-Csv:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Export-Csv : The term 'Export-Csv' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:722 char:20
++ $allEventsExport | Export-Csv -Path $eventsCsv -NoTypeInformation -En ...
++                    ~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Export-Csv:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Get-Date : The term 'Get-Date' is not recognized as the name of a cmdlet, function, script file, or operable program. Check 
+the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:748 char:17
++ <p>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
++                 ~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Get-Date:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Exception calling "WriteAllText" with "3" argument(s): "Empty path name is not legal."
+At line:794 char:1
++ [System.IO.File]::WriteAllText($htmlPath, $html, [System.Text.Encodin ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:) [], MethodInvocationException
+    + FullyQualifiedErrorId : ArgumentException
+ 
+Get-Date : The term 'Get-Date' is not recognized as the name of a cmdlet, function, script file, or operable program. Check 
+the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:801 char:31
++     GeneratedOn            = (Get-Date).ToString('s')
++                               ~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Get-Date:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+ConvertTo-Json : The term 'ConvertTo-Json' is not recognized as the name of a cmdlet, function, script file, or operable 
+program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:824 char:12
++ $payload | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonPath -En ...
++            ~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (ConvertTo-Json:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:830 char:1
++ Write-Log "=========================================" -Level OK
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:831 char:1
++ Write-Log "AD Daily Health Summary Complete!" -Level OK
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:832 char:1
++ Write-Log "=========================================" -Level OK
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:833 char:1
++ Write-Log ("HTML : {0}" -f $htmlPath) -Level OK
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:834 char:1
++ Write-Log ("CSV  : {0}" -f $dcCsv) -Level OK
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:835 char:1
++ Write-Log ("CSV  : {0}" -f $groupCsv) -Level OK
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:836 char:1
++ Write-Log ("CSV  : {0}" -f $eventsCsv) -Level OK
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:837 char:1
++ Write-Log ("JSON : {0}" -f $jsonPath) -Level OK
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:838 char:1
++ Write-Log "=========================================" -Level OK
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:839 char:1
++ Write-Log "Event Summary (last $EventLookbackHours hour(s)):" -Level  ...
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:840 char:1
++ Write-Log ("  - Account Lockouts   : {0}" -f $aggregatedEvents.Accoun ...
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:841 char:1
++ Write-Log ("  - Failed Logons      : {0}" -f $aggregatedEvents.Failed ...
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:842 char:1
++ Write-Log ("  - Group Changes      : {0}" -f $aggregatedEvents.GroupM ...
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:843 char:1
++ Write-Log ("  - Unexpected Shutdown: {0}" -f $aggregatedEvents.Unexpe ...
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+Write-Log : The term 'Write-Log' is not recognized as the name of a cmdlet, function, script file, or operable program. 
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:844 char:1
++ Write-Log "=========================================" -Level OK
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Write-Log:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+
+
+HtmlReport : 
+DcCsv      : 
+GroupCsv   : 
+EventsCsv  : 
+JsonReport : 
+
+Stack empty.
+    + CategoryInfo          : NotSpecified: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
