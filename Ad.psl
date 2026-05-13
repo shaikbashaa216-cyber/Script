@@ -7,33 +7,45 @@ param(
     [ValidateRange(1, 25)]
     [int]$DemoDomainControllerLimit = 3,
     [ValidateRange(1, 50)]
-    [int]$MaxConcurrency = 25
+    [int]$MaxConcurrency = 25,
+    [ValidateRange(1, 24)]
+    [int]$EventLookbackHours = 1
 )
- 
+
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
- 
+
+#region Functions
+
 function Write-Log {
     param(
         [string]$Message,
         [string]$Level = 'INFO'
     )
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    Write-Host "[$ts] [$Level] $Message"
+    $color = switch ($Level) {
+        'ERROR' { 'Red' }
+        'WARN'  { 'Yellow' }
+        'OK'    { 'Green' }
+        default { 'White' }
+    }
+    Write-Host "[$ts] [$Level] $Message" -ForegroundColor $color
 }
- 
+
 function HtmlSafe {
     param([object]$Value)
     if ($null -eq $Value) { return '' }
     return [System.Net.WebUtility]::HtmlEncode([string]$Value)
 }
- 
+
 function Get-SvcBadge {
     param([string]$Status)
-    $cls = if ($Status -eq 'Running') { 'svc-ok' } elseif ($Status -eq 'Unknown') { 'svc-unk' } else { 'svc-bad' }
+    $cls = if ($Status -eq 'Running') { 'svc-ok' } 
+           elseif ($Status -eq 'Unknown') { 'svc-unk' } 
+           else { 'svc-bad' }
     return "<span class='svc $cls'>$(HtmlSafe $Status)</span>"
 }
- 
+
 function Write-HealthRunbook {
     $lines = @(
         'AD Daily Health Summary Runbook',
@@ -44,8 +56,8 @@ function Write-HealthRunbook {
         'Custom output folder:',
         'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -OutputDirectory C:\Temp\AD_Daily_Health',
         '',
-        'Large environment (faster parallel collection):',
-        'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -MaxConcurrency 30',
+        'Large environment with 200+ DCs:',
+        'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -MaxConcurrency 30 -EventLookbackHours 2',
         '',
         'Run without repadmin text block:',
         'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -IncludeReplicationText:$false',
@@ -53,51 +65,193 @@ function Write-HealthRunbook {
         'Demo mode (safe showcase output):',
         'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -DemoMode -DemoDomainControllerLimit 10',
         '',
-        'Demo mode with verbose-like larger preview:',
-        'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -DemoMode -DemoDomainControllerLimit 20 -MaxConcurrency 20',
-        '',
         'Print this runbook only:',
         'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -Runbook'
     )
- 
     Write-Host ($lines -join [Environment]::NewLine)
 }
- 
-if ($Runbook) {
-    Write-HealthRunbook
-    return
+
+# Event log collection function (runs on each DC)
+function Get-DCEventLogs {
+    param(
+        [string]$ComputerName,
+        [datetime]$StartTime,
+        [int]$TimeoutSeconds = 60
+    )
+    
+    $result = [pscustomobject]@{
+        ComputerName = $ComputerName
+        Success = $false
+        ErrorMessage = $null
+        AccountLockouts = @()           # 4740
+        SuccessfulLogons = @()          # 4624
+        Logoffs = @()                   # 4634, 4647
+        FailedLogons = @()              # 4625
+        UserAccountChanges = @()        # 4720, 4722, 4725, 4738
+        PasswordChanges = @()           # 4723, 4724
+        GroupMembershipChanges = @()    # 4728, 4732, 4756
+        ADObjectChanges = @()           # 5136-5139
+        AuditPolicyChanges = @()        # 4719
+        SpecialLogon = @()              # 4672
+        ExplicitCredentialLogon = @()   # 4648
+        AccountUnlocked = @()           # 4767
+        UnexpectedShutdown = @()        # 41, 6008
+        PlannedRestart = @()            # 1074
+        EventLogShutdown = @()          # 1100
+        TotalEventsFound = 0
+    }
+    
+    try {
+        $scriptBlock = {
+            param($Computer, $Start, $Timeout)
+            
+            $events = @{}
+            $eventIds = @{
+                AccountLockouts = 4740
+                SuccessfulLogons = 4624
+                Logoffs = @(4634, 4647)
+                FailedLogons = 4625
+                UserAccountChanges = @(4720, 4722, 4725, 4738)
+                PasswordChanges = @(4723, 4724)
+                GroupMembershipChanges = @(4728, 4732, 4756)
+                ADObjectChanges = @(5136, 5137, 5138, 5139)
+                AuditPolicyChanges = 4719
+                SpecialLogon = 4672
+                ExplicitCredentialLogon = 4648
+                AccountUnlocked = 4767
+                UnexpectedShutdown = @(41, 6008)
+                PlannedRestart = 1074
+                EventLogShutdown = 1100
+            }
+            
+            $allIds = $eventIds.Values | ForEach-Object { $_ } | Sort-Object -Unique
+            
+            try {
+                $filterHash = @{LogName='Security'; StartTime=$Start; ID=$allIds}
+                $secEvents = Get-WinEvent -ComputerName $Computer -FilterHashtable $filterHash -ErrorAction Stop -MaxEvents 5000
+                
+                $filterHash = @{LogName='System'; StartTime=$Start; ID=$eventIds.UnexpectedShutdown + $eventIds.PlannedRestart + $eventIds.EventLogShutdown}
+                $sysEvents = Get-WinEvent -ComputerName $Computer -FilterHashtable $filterHash -ErrorAction SilentlyContinue -MaxEvents 1000
+                
+                $allEvents = @($secEvents) + @($sysEvents)
+            }
+            catch {
+                $allEvents = @()
+            }
+            
+            $resultObj = @{
+                AccountLockouts = @()
+                SuccessfulLogons = @()
+                Logoffs = @()
+                FailedLogons = @()
+                UserAccountChanges = @()
+                PasswordChanges = @()
+                GroupMembershipChanges = @()
+                ADObjectChanges = @()
+                AuditPolicyChanges = @()
+                SpecialLogon = @()
+                ExplicitCredentialLogon = @()
+                AccountUnlocked = @()
+                UnexpectedShutdown = @()
+                PlannedRestart = @()
+                EventLogShutdown = @()
+                TotalEventsFound = 0
+            }
+            
+            foreach ($evt in $allEvents) {
+                $evtTime = $evt.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+                $evtId = $evt.Id
+                $message = $evt.Message -replace "`n", ' ' -replace "`r", ' ' -replace ',', ';'
+                $shortMsg = if ($message.Length -gt 200) { $message.Substring(0, 197) + '...' } else { $message }
+                
+                $eventObj = @{
+                    Time = $evtTime
+                    Id = $evtId
+                    Message = $shortMsg
+                }
+                
+                switch ($evtId) {
+                    4740 { $resultObj.AccountLockouts += $eventObj }
+                    4624 { $resultObj.SuccessfulLogons += $eventObj }
+                    4634 { $resultObj.Logoffs += $eventObj }
+                    4647 { $resultObj.Logoffs += $eventObj }
+                    4625 { $resultObj.FailedLogons += $eventObj }
+                    4720 { $resultObj.UserAccountChanges += $eventObj }
+                    4722 { $resultObj.UserAccountChanges += $eventObj }
+                    4725 { $resultObj.UserAccountChanges += $eventObj }
+                    4738 { $resultObj.UserAccountChanges += $eventObj }
+                    4723 { $resultObj.PasswordChanges += $eventObj }
+                    4724 { $resultObj.PasswordChanges += $eventObj }
+                    4728 { $resultObj.GroupMembershipChanges += $eventObj }
+                    4732 { $resultObj.GroupMembershipChanges += $eventObj }
+                    4756 { $resultObj.GroupMembershipChanges += $eventObj }
+                    5136 { $resultObj.ADObjectChanges += $eventObj }
+                    5137 { $resultObj.ADObjectChanges += $eventObj }
+                    5138 { $resultObj.ADObjectChanges += $eventObj }
+                    5139 { $resultObj.ADObjectChanges += $eventObj }
+                    4719 { $resultObj.AuditPolicyChanges += $eventObj }
+                    4672 { $resultObj.SpecialLogon += $eventObj }
+                    4648 { $resultObj.ExplicitCredentialLogon += $eventObj }
+                    4767 { $resultObj.AccountUnlocked += $eventObj }
+                    41   { $resultObj.UnexpectedShutdown += $eventObj }
+                    6008 { $resultObj.UnexpectedShutdown += $eventObj }
+                    1074 { $resultObj.PlannedRestart += $eventObj }
+                    1100 { $resultObj.EventLogShutdown += $eventObj }
+                }
+                $resultObj.TotalEventsFound++
+            }
+            
+            return $resultObj
+        }
+        
+        $job = Start-Job -ScriptBlock $scriptBlock -ArgumentList $ComputerName, $StartTime, $TimeoutSeconds
+        $jobResult = $job | Wait-Job -Timeout $TimeoutSeconds | Receive-Job -ErrorAction SilentlyContinue
+        
+        if ($job.State -eq 'Running') {
+            Stop-Job $job -ErrorAction SilentlyContinue
+            $result.ErrorMessage = "Timeout after ${TimeoutSeconds} seconds"
+        }
+        elseif ($jobResult) {
+            $result.Success = $true
+            $result.AccountLockouts = $jobResult.AccountLockouts
+            $result.SuccessfulLogons = $jobResult.SuccessfulLogons
+            $result.Logoffs = $jobResult.Logoffs
+            $result.FailedLogons = $jobResult.FailedLogons
+            $result.UserAccountChanges = $jobResult.UserAccountChanges
+            $result.PasswordChanges = $jobResult.PasswordChanges
+            $result.GroupMembershipChanges = $jobResult.GroupMembershipChanges
+            $result.ADObjectChanges = $jobResult.ADObjectChanges
+            $result.AuditPolicyChanges = $jobResult.AuditPolicyChanges
+            $result.SpecialLogon = $jobResult.SpecialLogon
+            $result.ExplicitCredentialLogon = $jobResult.ExplicitCredentialLogon
+            $result.AccountUnlocked = $jobResult.AccountUnlocked
+            $result.UnexpectedShutdown = $jobResult.UnexpectedShutdown
+            $result.PlannedRestart = $jobResult.PlannedRestart
+            $result.EventLogShutdown = $jobResult.EventLogShutdown
+            $result.TotalEventsFound = $jobResult.TotalEventsFound
+            $result.ErrorMessage = $null
+        }
+        
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+    }
+    catch {
+        $result.ErrorMessage = $_.Exception.Message
+    }
+    
+    return $result
 }
- 
-if (-not (Test-Path -LiteralPath $OutputDirectory)) {
-    New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-}
- 
-Write-Log 'Loading ActiveDirectory module...'
-Import-Module ActiveDirectory -ErrorAction Stop
- 
-$stamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
-$domain = Get-ADDomain
-$forest = Get-ADForest
-$dcs    = @(Get-ADDomainController -Filter *)
- 
-if ($DemoMode -and $dcs.Count -gt $DemoDomainControllerLimit) {
-    $dcs = @($dcs | Sort-Object HostName | Select-Object -First $DemoDomainControllerLimit)
-    Write-Log ("Demo mode: limited to first {0} domain controllers." -f $DemoDomainControllerLimit)
-}
- 
-# ── Parallel DC health collection via RunspacePool (PS5.1 compatible) ──────────
-Write-Log ("Starting parallel health collection: {0} DCs, max concurrency {1}..." -f $dcs.Count, $MaxConcurrency)
- 
+
+# DC health check script
 $dcCheckScript = {
-    param([string]$HostName, [string]$Domain, [string]$Site, [string]$IPv4)
- 
+    param([string]$HostName, [string]$Domain, [string]$Site, [string]$IPv4, [datetime]$EventStartTime, [int]$EventTimeout)
+    
     $reachable = $false
     try { $reachable = [bool](Test-Connection -ComputerName $HostName -Count 1 -Quiet -ErrorAction Stop) }
     catch { $reachable = $false }
- 
+    
     $svc = @{ NTDS = 'Unknown'; Netlogon = 'Unknown'; KDC = 'Unknown'; DFSR = 'Unknown'; DNS = 'Unknown' }
     $svcError = ''
- 
+    
     if ($reachable) {
         try {
             $services = @(Get-Service -ComputerName $HostName -Name NTDS, Netlogon, KDC, DFSR, DNS -ErrorAction Stop)
@@ -108,10 +262,15 @@ $dcCheckScript = {
             foreach ($k in @('NTDS', 'Netlogon', 'KDC', 'DFSR', 'DNS')) { $svc[$k] = 'Unavailable' }
         }
     }
- 
-    $anyBad   = @($svc.Values | Where-Object { $_ -notin @('Running', 'Unknown') })
+    
+    $anyBad = @($svc.Values | Where-Object { $_ -notin @('Running', 'Unknown') })
     $dcStatus = if (-not $reachable) { 'Red' } elseif ($anyBad.Count -gt 0) { 'Yellow' } else { 'Green' }
- 
+    
+    $events = $null
+    if ($reachable) {
+        $events = Get-DCEventLogs -ComputerName $HostName -StartTime $EventStartTime -TimeoutSeconds $EventTimeout
+    }
+    
     [pscustomobject]@{
         Domain      = $Domain
         HostName    = $HostName
@@ -125,41 +284,138 @@ $dcCheckScript = {
         DNS         = $svc['DNS']
         SvcError    = $svcError
         DcStatus    = $dcStatus
+        Events      = $events
     }
 }
- 
+
+#endregion Functions
+
+if ($Runbook) {
+    Write-HealthRunbook
+    return
+}
+
+#region Initialization
+
+if (-not (Test-Path -LiteralPath $OutputDirectory)) {
+    New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+}
+
+Write-Log 'Loading ActiveDirectory module...'
+Import-Module ActiveDirectory -ErrorAction Stop
+
+$eventStartTime = (Get-Date).AddHours(-$EventLookbackHours)
+Write-Log "Collecting events from last $EventLookbackHours hour(s) (since $eventStartTime)"
+
+$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$domain = Get-ADDomain
+$forest = Get-ADForest
+$dcs = @(Get-ADDomainController -Filter *)
+
+if ($DemoMode -and $dcs.Count -gt $DemoDomainControllerLimit) {
+    $dcs = @($dcs | Sort-Object HostName | Select-Object -First $DemoDomainControllerLimit)
+    Write-Log ("Demo mode: limited to first {0} domain controllers." -f $DemoDomainControllerLimit)
+}
+
+#endregion Initialization
+
+#region Parallel DC Health & Event Collection
+
+Write-Log ("Starting parallel health and event collection: {0} DCs, max concurrency {1}..." -f $dcs.Count, $MaxConcurrency)
+
 $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $MaxConcurrency)
 $pool.Open()
- 
+
 $jobs = @()
 foreach ($dc in $dcs) {
     $ps = [System.Management.Automation.PowerShell]::Create()
     $ps.RunspacePool = $pool
-    [void]$ps.AddScript($dcCheckScript)
+    [void]$ps.AddScript($dcCheckScript.ToString())
     [void]$ps.AddArgument([string]$dc.HostName)
     [void]$ps.AddArgument([string]$dc.Domain)
     [void]$ps.AddArgument([string]$dc.Site)
     [void]$ps.AddArgument([string]$dc.IPv4Address)
-    $jobs += [pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke() }
+    [void]$ps.AddArgument([datetime]$eventStartTime)
+    [void]$ps.AddArgument(60)
+    $jobs += [pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke(); HostName = $dc.HostName }
 }
- 
+
 $dcRows = @()
-$done   = 0
+$allEventData = @()
+$done = 0
 foreach ($job in $jobs) {
     $result = $job.PS.EndInvoke($job.Handle)
-    if ($null -ne $result) { $dcRows += $result }
+    if ($null -ne $result) { 
+        $dcRows += $result
+        if ($result.Events) {
+            $allEventData += $result.Events
+        }
+    }
     $job.PS.Dispose()
     $done++
     if ($done % 20 -eq 0 -or $done -eq $jobs.Count) {
         Write-Log ("Progress: {0}/{1} DCs collected." -f $done, $jobs.Count)
     }
 }
- 
+
 $pool.Close()
 $pool.Dispose()
 Write-Log ("Parallel collection complete. {0} results." -f $dcRows.Count)
- 
-# ── FSMO role holder reachability ──────────────────────────────────────────────
+
+# Aggregate events across all DCs
+$aggregatedEvents = @{
+    AccountLockouts = @()
+    SuccessfulLogons = @()
+    Logoffs = @()
+    FailedLogons = @()
+    UserAccountChanges = @()
+    PasswordChanges = @()
+    GroupMembershipChanges = @()
+    ADObjectChanges = @()
+    AuditPolicyChanges = @()
+    SpecialLogon = @()
+    ExplicitCredentialLogon = @()
+    AccountUnlocked = @()
+    UnexpectedShutdown = @()
+    PlannedRestart = @()
+    EventLogShutdown = @()
+}
+
+$totalEventsFound = 0
+$dcsWithEventErrors = @()
+
+foreach ($eventData in $allEventData) {
+    if (-not $eventData.Success) {
+        $dcsWithEventErrors += [pscustomobject]@{
+            DC = $eventData.ComputerName
+            Error = $eventData.ErrorMessage
+        }
+    }
+    
+    $totalEventsFound += $eventData.TotalEventsFound
+    $aggregatedEvents.AccountLockouts += $eventData.AccountLockouts
+    $aggregatedEvents.SuccessfulLogons += $eventData.SuccessfulLogons
+    $aggregatedEvents.Logoffs += $eventData.Logoffs
+    $aggregatedEvents.FailedLogons += $eventData.FailedLogons
+    $aggregatedEvents.UserAccountChanges += $eventData.UserAccountChanges
+    $aggregatedEvents.PasswordChanges += $eventData.PasswordChanges
+    $aggregatedEvents.GroupMembershipChanges += $eventData.GroupMembershipChanges
+    $aggregatedEvents.ADObjectChanges += $eventData.ADObjectChanges
+    $aggregatedEvents.AuditPolicyChanges += $eventData.AuditPolicyChanges
+    $aggregatedEvents.SpecialLogon += $eventData.SpecialLogon
+    $aggregatedEvents.ExplicitCredentialLogon += $eventData.ExplicitCredentialLogon
+    $aggregatedEvents.AccountUnlocked += $eventData.AccountUnlocked
+    $aggregatedEvents.UnexpectedShutdown += $eventData.UnexpectedShutdown
+    $aggregatedEvents.PlannedRestart += $eventData.PlannedRestart
+    $aggregatedEvents.EventLogShutdown += $eventData.EventLogShutdown
+}
+
+Write-Log "Total security/audit events collected: $totalEventsFound"
+
+#endregion Parallel DC Health & Event Collection
+
+#region AD Data Collection (FSMO, Replication, Groups)
+
 $fsmoMap = [ordered]@{
     PDCEmulator          = [string]$domain.PDCEmulator
     RIDMaster            = [string]$domain.RIDMaster
@@ -167,15 +423,14 @@ $fsmoMap = [ordered]@{
     SchemaMaster         = [string]$forest.SchemaMaster
     DomainNamingMaster   = [string]$forest.DomainNamingMaster
 }
- 
+
 $fsmoRows = @()
 foreach ($role in $fsmoMap.GetEnumerator()) {
     $ok = $false
     try { $ok = [bool](Test-Connection -ComputerName $role.Value -Count 1 -Quiet -ErrorAction Stop) } catch {}
     $fsmoRows += [pscustomobject]@{ Role = $role.Key; Holder = $role.Value; Reachable = $ok }
 }
- 
-# ── Replication failures (one call for the entire forest) ──────────────────────
+
 $replFailureRows = @()
 try {
     $replFailures = @(Get-ADReplicationFailure -Scope Forest -ErrorAction Stop)
@@ -191,14 +446,13 @@ try {
     }
 }
 catch { Write-Log ("Get-ADReplicationFailure: {0}" -f $_.Exception.Message) -Level WARN }
- 
+
 $replText = ''
 if ($IncludeReplicationText -and (Get-Command repadmin.exe -ErrorAction SilentlyContinue)) {
     try { $replText = (& repadmin.exe /replsummary | Out-String) }
     catch { $replText = "repadmin failed: $($_.Exception.Message)" }
 }
- 
-# ── Privileged group membership ─────────────────────────────────────────────────
+
 $privGroups = @('Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Administrators', 'DNSAdmins')
 $memberRows = @()
 foreach ($group in $privGroups) {
@@ -221,25 +475,35 @@ foreach ($group in $privGroups) {
         }
     }
 }
- 
-# ── Overall health scoring ─────────────────────────────────────────────────────
+
+#endregion AD Data Collection
+
+#region Health Scoring
+
 $reachableCount   = @($dcRows | Where-Object { $_.Reachable }).Count
 $unreachableCount = @($dcRows | Where-Object { -not $_.Reachable }).Count
 $issueRows        = @($dcRows | Where-Object { $_.DcStatus -ne 'Green' })
 $fsmoDown         = @($fsmoRows | Where-Object { -not $_.Reachable }).Count
 $replIssueCount   = $replFailureRows.Count
- 
+
+# Critical event detection
+$criticalEvents = @()
+$criticalEvents += $aggregatedEvents.AccountLockouts.Count
+$criticalEvents += $aggregatedEvents.FailedLogons.Count
+$criticalEvents += $aggregatedEvents.GroupMembershipChanges.Count
+$criticalEvents += $aggregatedEvents.UnexpectedShutdown.Count
+$hasCriticalEvents = ($criticalEvents | Measure-Object -Sum).Sum -gt 0
+
 $healthStatus = if ($unreachableCount -gt 0 -or $fsmoDown -gt 0) { 'Red' }
-               elseif ($issueRows.Count -gt 0 -or $replIssueCount -gt 0) { 'Yellow' }
+               elseif ($issueRows.Count -gt 0 -or $replIssueCount -gt 0 -or $hasCriticalEvents) { 'Yellow' }
                else { 'Green' }
- 
+
 $escalationGuidance = switch ($healthStatus) {
     'Red'    { 'IMMEDIATE ACTION: One or more domain controllers or FSMO role holders are unreachable. Run Emergency_AD_Delivery_Report.ps1 with -ReportProfile Emergency now.' }
-    'Yellow' { 'ATTENTION: Service degradation or replication failures detected. Review the issues below. Escalate with Emergency_AD_Delivery_Report.ps1 if symptoms persist.' }
-    default  { 'All domain controllers and FSMO role holders are healthy. No escalation required. Continue daily monitoring.' }
+    'Yellow' { 'ATTENTION: Service degradation, replication failures, or critical security events detected. Review the issues below. Escalate with Emergency_AD_Delivery_Report.ps1 if symptoms persist.' }
+    default  { 'All domain controllers and FSMO role holders are healthy. No critical security events detected. Continue daily monitoring.' }
 }
- 
-# ── Per-site statistics for the visual grid ────────────────────────────────────
+
 $siteStats = @($dcRows | Group-Object -Property Site | ForEach-Object {
     $sg     = @($_.Group)
     $sRed   = @($sg | Where-Object { $_.DcStatus -eq 'Red'    }).Count
@@ -255,9 +519,11 @@ $siteStats = @($dcRows | Group-Object -Property Site | ForEach-Object {
         Color  = $sColor
     }
 } | Sort-Object Color, Site)
- 
-# ── Build HTML fragments ────────────────────────────────────────────────────────
-# Site visual grid
+
+#endregion Health Scoring
+
+#region HTML Generation
+
 $siteCardsHtml = (@($siteStats) | ForEach-Object {
     $statusLine = if ($_.Red -gt 0) { "$($_.Red) unreachable" }
                   elseif ($_.Yellow -gt 0) { "$($_.Yellow) service issue" }
@@ -268,8 +534,7 @@ $siteCardsHtml = (@($siteStats) | ForEach-Object {
     "<div class='site-count'>$dcText</div>" +
     "<div class='site-status'>$statusLine</div></div>"
 }) -join [Environment]::NewLine
- 
-# Priority issues table
+
 $priorityHtml = if ($issueRows.Count -eq 0) {
     "<tr><td colspan='9'>No issues detected in this run.</td></tr>"
 } else {
@@ -281,15 +546,13 @@ $priorityHtml = if ($issueRows.Count -eq 0) {
         "<td>$(HtmlSafe $_.KDC)</td><td>$(HtmlSafe $_.DFSR)</td><td>$(HtmlSafe $_.DNS)</td></tr>"
     }) -join [Environment]::NewLine
 }
- 
-# FSMO table
+
 $fsmoHtml = (@($fsmoRows) | ForEach-Object {
     $rc   = if (-not $_.Reachable) { 'row-red' } else { '' }
     $icon = if ($_.Reachable) { "<span class='svc svc-ok'>Reachable</span>" } else { "<span class='svc svc-bad'>UNREACHABLE</span>" }
     "<tr class='$rc'><td>$(HtmlSafe $_.Role)</td><td>$(HtmlSafe $_.Holder)</td><td>$icon</td></tr>"
 }) -join [Environment]::NewLine
- 
-# Replication failure table
+
 $replFailHtml = if ($replFailureRows.Count -eq 0) {
     "<tr><td colspan='6'>No replication failures detected across the forest.</td></tr>"
 } else {
@@ -299,8 +562,37 @@ $replFailHtml = if ($replFailureRows.Count -eq 0) {
         "<td>$(HtmlSafe $_.FirstFailureTime)</td><td>$(HtmlSafe $_.LastFailureTime)</td></tr>"
     }) -join [Environment]::NewLine
 }
- 
-# Per-site collapsible DC sections (all DCs, grouped by site, with search data attribute)
+
+# Event Tables HTML
+function Format-EventTable {
+    param($Events, $Title, $Columns = @('Time', 'DC', 'Event ID', 'Message'))
+    
+    if ($Events.Count -eq 0) {
+        return "<p><em>No $Title events found in the last $EventLookbackHours hour(s).</em></p>"
+    }
+    
+    $rows = @()
+    foreach ($evt in $Events | Select-Object -First 100) {
+        $dc = if ($evt.DC) { $evt.DC } else { $evt.ComputerName }
+        $rows += "<tr><td>$(HtmlSafe $evt.Time)</td><td>$(HtmlSafe $dc)</td><td>$($evt.Id)</td><td>$(HtmlSafe $evt.Message)</td></tr>"
+    }
+    
+    $moreMsg = if ($Events.Count -gt 100) { "<p class='meta'>+ $($Events.Count - 100) more events (see CSV for full list)</p>" } else { "" }
+    
+    return @"
+<h3>$Title ($($Events.Count) events)</h3>
+<div style='overflow-x: auto; max-height: 400px;'>
+<table class='event-table'>
+<thead><tr><th>Time</th><th>DC</th><th>Event ID</th><th>Message</th></tr></thead>
+<tbody>
+$($rows -join [Environment]::NewLine)
+</tbody>
+</table>
+</div>
+$moreMsg
+"@
+}
+
 $siteGroupHtml = (@($dcRows | Group-Object -Property Site | Sort-Object Name) | ForEach-Object {
     $siteName    = [string]$_.Name
     $safeId      = $siteName -replace '[^a-zA-Z0-9]', '_'
@@ -310,7 +602,7 @@ $siteGroupHtml = (@($dcRows | Group-Object -Property Site | Sort-Object Name) | 
     $badgeColor  = if ($sRed -gt 0) { 'red' } elseif ($sYel -gt 0) { 'yellow' } else { 'green' }
     $badgeLabel  = if ($sRed -gt 0) { "Red ($sRed unreachable)" } elseif ($sYel -gt 0) { "Yellow ($sYel issue)" } else { 'Green' }
     $dcCountText = if ($siteDcs.Count -eq 1) { '1 DC' } else { "$($siteDcs.Count) DCs" }
- 
+
     $rows = (@($siteDcs) | ForEach-Object {
         $rc        = switch ($_.DcStatus) { 'Red' { 'dc-row row-red' } 'Yellow' { 'dc-row row-yellow' } default { 'dc-row' } }
         $reachIcon = if ($_.Reachable) { "<span class='svc svc-ok'>&#10003;</span>" } else { "<span class='svc svc-bad'>&#10007;</span>" }
@@ -320,7 +612,7 @@ $siteGroupHtml = (@($dcRows | Group-Object -Property Site | Sort-Object Name) | 
         "<td>$(Get-SvcBadge $_.NTDS)</td><td>$(Get-SvcBadge $_.Netlogon)</td>" +
         "<td>$(Get-SvcBadge $_.KDC)</td><td>$(Get-SvcBadge $_.DFSR)</td><td>$(Get-SvcBadge $_.DNS)</td></tr>"
     }) -join [Environment]::NewLine
- 
+
     $block  = "<div class='site-section'>"
     $block += "<div class='site-header' onclick='toggleSite(`"$safeId`")'>"
     $block += "<span class='badge badge-$badgeColor'>$badgeLabel</span>"
@@ -333,8 +625,7 @@ $siteGroupHtml = (@($dcRows | Group-Object -Property Site | Sort-Object Name) | 
     $block += "<tbody>$rows</tbody></table></div></div>"
     $block
 }) -join [Environment]::NewLine
- 
-# Privileged groups (first 50 in HTML, full in CSV)
+
 $privHtml = if ($memberRows.Count -eq 0) {
     "<tr><td colspan='4'>No privileged group members returned.</td></tr>"
 } else {
@@ -343,40 +634,67 @@ $privHtml = if ($memberRows.Count -eq 0) {
         "<td>$(HtmlSafe $_.MemberSam)</td><td>$(HtmlSafe $_.MemberClass)</td></tr>"
     }) -join [Environment]::NewLine
 }
- 
+
 $healthLower = $healthStatus.ToLowerInvariant()
 $healthRunExamples = @(
     'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1',
     'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -OutputDirectory C:\Temp\AD_Daily_Health',
-    'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -MaxConcurrency 30',
+    'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -MaxConcurrency 30 -EventLookbackHours 2',
     'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -IncludeReplicationText:$false',
-    'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -DemoMode -DemoDomainControllerLimit 10',
-    'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -DemoMode -DemoDomainControllerLimit 20 -MaxConcurrency 20'
+    'powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -DemoMode -DemoDomainControllerLimit 10'
 )
 $healthRunExamplesHtml = (@($healthRunExamples) | ForEach-Object { "<li><code>$(HtmlSafe $_)</code></li>" }) -join [Environment]::NewLine
- 
-# ── Output paths ────────────────────────────────────────────────────────────────
+
+#endregion HTML Generation
+
+#region Output Files
+
 $htmlPath = Join-Path $OutputDirectory ("AD_Daily_Health_Summary_{0}.html" -f $stamp)
 $dcCsv    = Join-Path $OutputDirectory ("AD_Daily_Health_DCs_{0}.csv"     -f $stamp)
 $groupCsv = Join-Path $OutputDirectory ("AD_Daily_Health_Groups_{0}.csv"  -f $stamp)
+$eventsCsv = Join-Path $OutputDirectory ("AD_Daily_Health_Events_{0}.csv"  -f $stamp)
 $jsonPath = Join-Path $OutputDirectory ("AD_Daily_Health_Summary_{0}.json" -f $stamp)
- 
-$dcRows     | Export-Csv -Path $dcCsv    -NoTypeInformation -Encoding UTF8
+
+$dcRows | Export-Csv -Path $dcCsv -NoTypeInformation -Encoding UTF8
 $memberRows | Export-Csv -Path $groupCsv -NoTypeInformation -Encoding UTF8
- 
-# ── Generate HTML ────────────────────────────────────────────────────────────────
+
+# Export all events to CSV for analysis
+$allEventsExport = @()
+foreach ($evtData in $allEventData) {
+    foreach ($evt in $evtData.AccountLockouts) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.SuccessfulLogons) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.Logoffs) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.FailedLogons) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.UserAccountChanges) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.PasswordChanges) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.GroupMembershipChanges) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.ADObjectChanges) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.AuditPolicyChanges) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.SpecialLogon) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.ExplicitCredentialLogon) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.AccountUnlocked) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.UnexpectedShutdown) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.PlannedRestart) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+    foreach ($evt in $evtData.EventLogShutdown) { $evt | Add-Member -NotePropertyName "DC" -NotePropertyValue $evtData.ComputerName -Force; $allEventsExport += $evt }
+}
+$allEventsExport | Export-Csv -Path $eventsCsv -NoTypeInformation -Encoding UTF8
+
+#endregion Output Files
+
+#region HTML Template
+
 $html = @"
 <!DOCTYPE html>
 <html lang='en'>
 <head>
 <meta charset='UTF-8' />
 <meta name='viewport' content='width=device-width, initial-scale=1.0' />
-<title>AD Daily Health Summary</title>
+<title>AD Daily Health Summary with Security Events</title>
 <style>
 :root { --bg1:#eaf3ff; --bg2:#dbeafe; --panel:#ffffff; --border:#bfd6f6; --title:#0f2a56; --text:#16335f; --muted:#47678f; --head:#e1eeff; }
 * { box-sizing: border-box; }
 body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 16px; background: linear-gradient(160deg, var(--bg1) 0%, var(--bg2) 100%); color: var(--text); min-height: 100vh; }
-h1, h2 { margin: 0 0 8px 0; color: var(--title); }
+h1, h2, h3 { margin: 0 0 8px 0; color: var(--title); }
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px; box-shadow: 0 3px 12px rgba(22,74,140,0.08); }
 .meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
 .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
@@ -411,6 +729,9 @@ h1, h2 { margin: 0 0 8px 0; color: var(--title); }
 table { border-collapse: collapse; width: 100%; font-size: 12px; background: #fff; }
 th, td { border: 1px solid #d4e4fb; padding: 6px 8px; text-align: left; vertical-align: middle; }
 th { background: var(--head); color: var(--title); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.event-table { font-size: 11px; }
+.event-table td { max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.event-table td:last-child { white-space: normal; word-break: break-word; }
 .cmd-list { margin: 8px 0 0 18px; }
 .cmd-list li { margin: 5px 0; }
 code { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 2px 6px; color: #1e3a8a; font-family: Consolas, 'Courier New', monospace; font-size: 12px; }
@@ -423,16 +744,23 @@ code { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; paddi
 .search-bar { width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 13px; margin-bottom: 10px; color: var(--text); background: #fff; }
 .search-bar:focus { outline: 2px solid #3b82f6; border-color: #3b82f6; }
 pre { background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 12px; line-height: 1.5; }
+.tab-container { margin-bottom: 10px; }
+.tab-buttons { display: flex; gap: 5px; border-bottom: 1px solid var(--border); margin-bottom: 10px; }
+.tab-btn { padding: 8px 16px; background: var(--head); border: none; cursor: pointer; border-radius: 6px 6px 0 0; font-weight: 500; }
+.tab-btn.active { background: var(--panel); border-bottom: 2px solid var(--title); }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
 </style>
 </head>
 <body>
 <div class='panel'>
-<h1>AD Daily Health Summary</h1>
+<h1>AD Daily Health & Security Summary</h1>
 <div class='meta'>Generated: $(HtmlSafe (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))</div>
 <div class='meta'>Domain: $(HtmlSafe $domain.DNSRoot) &nbsp;|&nbsp; Forest: $(HtmlSafe $forest.Name) &nbsp;|&nbsp; Domain Controllers: $($dcRows.Count) &nbsp;|&nbsp; AD Sites: $($siteStats.Count)</div>
-<div class='meta'>Audience: IT Operations, Management, and Leadership</div>
+<div class='meta'>Event Lookback: Last $EventLookbackHours hour(s) (starting $(HtmlSafe $eventStartTime))</div>
+<div class='meta'>Audience: IT Operations, Security, Management, and Leadership</div>
 </div>
- 
+
 <div class='cards'>
 <div class='card'><div class='k'>Overall Health</div><div class='v'><span class='badge badge-$healthLower'>$(HtmlSafe $healthStatus)</span></div></div>
 <div class='card'><div class='k'>Domain Controllers</div><div class='v'>$($dcRows.Count)</div></div>
@@ -440,32 +768,30 @@ pre { background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 8px; ov
 <div class='card'><div class='k'>Unreachable</div><div class='v'>$unreachableCount</div></div>
 <div class='card'><div class='k'>Service Issues</div><div class='v'>$($issueRows.Count)</div></div>
 <div class='card'><div class='k'>Repl Failures</div><div class='v'>$replIssueCount</div></div>
-<div class='card'><div class='k'>AD Sites</div><div class='v'>$($siteStats.Count)</div></div>
-<div class='card'><div class='k'>FSMO Issues</div><div class='v'>$fsmoDown</div></div>
+<div class='card'><div class='k'>Total Events</div><div class='v'>$totalEventsFound</div></div>
+<div class='card'><div class='k'>Critical Events</div><div class='v'>$(($aggregatedEvents.AccountLockouts.Count + $aggregatedEvents.FailedLogons.Count + $aggregatedEvents.UnexpectedShutdown.Count + $aggregatedEvents.GroupMembershipChanges.Count))</div></div>
 </div>
- 
+
 <div class='panel'>
 <div class='esc esc-$healthLower'>$(HtmlSafe $escalationGuidance)</div>
 </div>
- 
+
 <div class='panel'>
 <h2>How To Run This Script</h2>
-<div class='meta'>Use these common command patterns, including demo mode for presentation output.</div>
 <ul class='cmd-list'>
 $healthRunExamplesHtml
 </ul>
 </div>
- 
+
 <div class='panel'>
 <h2>Site Health Overview</h2>
-<div class='meta'>One box per AD site. Red = unreachable DC. Yellow = service degradation. Green = all healthy.</div>
 <div class='site-grid'>
 $siteCardsHtml
 </div>
 </div>
- 
+
 <div class='panel'>
-<h2>Priority Issues</h2>
+<h2>Priority DC Issues</h2>
 <table>
 <thead><tr><th>Site</th><th>Domain Controller</th><th>IP</th><th>Reachable</th><th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></tr></thead>
 <tbody>
@@ -473,7 +799,48 @@ $priorityHtml
 </tbody>
 </table>
 </div>
- 
+
+<div class='panel'>
+<h2>Security & Audit Events</h2>
+<div class='meta'>Collected from last $EventLookbackHours hour(s). Full details in CSV: $(HtmlSafe $eventsCsv)</div>
+<div class='tab-container'>
+<div class='tab-buttons'>
+<button class='tab-btn active' onclick='showTab("critical")'>⚠ Critical/Security</button>
+<button class='tab-btn' onclick='showTab("account")'>👤 Account Management</button>
+<button class='tab-btn' onclick='showTab("system")'>🖥 System Events</button>
+</div>
+<div id='critical' class='tab-content active'>
+$(Format-EventTable -Events $allEventsExport -Title "Critical Security Events" -Columns @('Time','DC','Event ID','Message'))
+</div>
+<div id='account' class='tab-content'>
+<h3>Account Lockouts ($($aggregatedEvents.AccountLockouts.Count))</h3>
+$(if ($aggregatedEvents.AccountLockouts.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.AccountLockouts -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No account lockouts in the last $EventLookbackHours hour(s).</em></p>" })
+<h3>Failed Logons ($($aggregatedEvents.FailedLogons.Count))</h3>
+$(if ($aggregatedEvents.FailedLogons.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.FailedLogons -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No failed logons in the last $EventLookbackHours hour(s).</em></p>" })
+<h3>Successful Logons ($($aggregatedEvents.SuccessfulLogons.Count))</h3>
+$(if ($aggregatedEvents.SuccessfulLogons.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.SuccessfulLogons -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No successful logons in the last $EventLookbackHours hour(s).</em></p>" })
+<h3>User Account Changes ($($aggregatedEvents.UserAccountChanges.Count))</h3>
+$(if ($aggregatedEvents.UserAccountChanges.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.UserAccountChanges -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No user account changes in the last $EventLookbackHours hour(s).</em></p>" })
+<h3>Password Changes ($($aggregatedEvents.PasswordChanges.Count))</h3>
+$(if ($aggregatedEvents.PasswordChanges.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.PasswordChanges -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No password changes in the last $EventLookbackHours hour(s).</em></p>" })
+<h3>Group Membership Changes ($($aggregatedEvents.GroupMembershipChanges.Count))</h3>
+$(if ($aggregatedEvents.GroupMembershipChanges.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.GroupMembershipChanges -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No group membership changes in the last $EventLookbackHours hour(s).</em></p>" })
+<h3>AD Object Changes ($($aggregatedEvents.ADObjectChanges.Count))</h3>
+$(if ($aggregatedEvents.ADObjectChanges.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.ADObjectChanges -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No AD object changes in the last $EventLookbackHours hour(s).</em></p>" })
+</div>
+<div id='system' class='tab-content'>
+<h3>Unexpected Shutdowns ($($aggregatedEvents.UnexpectedShutdown.Count))</h3>
+$(if ($aggregatedEvents.UnexpectedShutdown.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.UnexpectedShutdown -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No unexpected shutdowns in the last $EventLookbackHours hour(s).</em></p>" })
+<h3>Planned Restarts ($($aggregatedEvents.PlannedRestart.Count))</h3>
+$(if ($aggregatedEvents.PlannedRestart.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.PlannedRestart -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No planned restarts in the last $EventLookbackHours hour(s).</em></p>" })
+<h3>Audit Policy Changes ($($aggregatedEvents.AuditPolicyChanges.Count))</h3>
+$(if ($aggregatedEvents.AuditPolicyChanges.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.AuditPolicyChanges -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No audit policy changes in the last $EventLookbackHours hour(s).</em></p>" })
+<h3>Special Logons ($($aggregatedEvents.SpecialLogon.Count))</h3>
+$(if ($aggregatedEvents.SpecialLogon.Count -gt 0) { Format-EventTable -Events $aggregatedEvents.SpecialLogon -Title "" -Columns @('Time','DC','Event ID','Message') } else { "<p><em>No special privilege logons in the last $EventLookbackHours hour(s).</em></p>" })
+</div>
+</div>
+</div>
+
 <div class='panel'>
 <h2>FSMO Role Holders</h2>
 <table>
@@ -483,7 +850,7 @@ $fsmoHtml
 </tbody>
 </table>
 </div>
- 
+
 <div class='panel'>
 <h2>Replication Failures</h2>
 <table>
@@ -493,17 +860,16 @@ $replFailHtml
 </tbody>
 </table>
 </div>
- 
+
 <div class='panel'>
 <h2>All Domain Controllers by Site</h2>
-<div class='meta'>$($dcRows.Count) DCs across $($siteStats.Count) sites. Click any site header to expand. Use the search box to jump to a specific DC.</div>
 <input class='search-bar' type='text' id='dcSearch' placeholder='Search by DC name, IP address, or site...' oninput='filterDCs(this.value)' />
 $siteGroupHtml
 </div>
- 
+
 <div class='panel'>
 <h2>Privileged Group Membership</h2>
-<div class='meta'>First 50 entries shown in HTML. Full list saved to: $(HtmlSafe $groupCsv) &nbsp;|&nbsp; Total members: $($memberRows.Count)</div>
+<div class='meta'>First 50 entries shown. Full list saved to: $(HtmlSafe $groupCsv) &nbsp;|&nbsp; Total members: $($memberRows.Count)</div>
 <table>
 <thead><tr><th>Group</th><th>Member Name</th><th>SAM Account</th><th>Type</th></tr></thead>
 <tbody>
@@ -511,12 +877,12 @@ $privHtml
 </tbody>
 </table>
 </div>
- 
+
 <div class='panel'>
 <h2>Replication Summary (repadmin /replsummary)</h2>
 <pre>$(HtmlSafe $replText)</pre>
 </div>
- 
+
 <script>
 function toggleSite(id) {
     var el = document.getElementById('site-' + id);
@@ -534,15 +900,34 @@ function filterDCs(val) {
         if (lower !== '') { t.style.display = ''; }
     });
 }
+function showTab(tabName) {
+    var tabs = ['critical', 'account', 'system'];
+    tabs.forEach(function(t) {
+        var content = document.getElementById(t);
+        var btn = document.querySelector('.tab-btn[onclick="showTab(\'' + t + '\')"]');
+        if (t === tabName) {
+            content.classList.add('active');
+            if (btn) btn.classList.add('active');
+        } else {
+            content.classList.remove('active');
+            if (btn) btn.classList.remove('active');
+        }
+    });
+}
 </script>
 </body>
 </html>
 "@
- 
+
 [System.IO.File]::WriteAllText($htmlPath, $html, [System.Text.Encoding]::UTF8)
- 
+
+#endregion HTML Template
+
+#region JSON Output
+
 $payload = [pscustomobject]@{
     GeneratedOn            = (Get-Date).ToString('s')
+    EventLookbackHours     = $EventLookbackHours
     Domain                 = [string]$domain.DNSRoot
     Forest                 = [string]$forest.Name
     HealthStatus           = $healthStatus
@@ -554,32 +939,53 @@ $payload = [pscustomobject]@{
     ServiceIssueCount      = $issueRows.Count
     ReplicationFailures    = $replIssueCount
     FsmoIssues             = $fsmoDown
+    TotalSecurityEvents    = $totalEventsFound
     SiteStats              = @($siteStats)
-    DomainControllers      = @($dcRows)
+    DomainControllers      = @($dcRows | Select-Object -ExcludeProperty Events)
     FsmoRoles              = @($fsmoRows)
     ReplicationFailureRows = @($replFailureRows)
     PrivilegedGroupMembers = @($memberRows)
     ReplicationSummaryText = $replText
+    EventSummary = @{
+        AccountLockouts      = $aggregatedEvents.AccountLockouts.Count
+        FailedLogons         = $aggregatedEvents.FailedLogons.Count
+        SuccessfulLogons     = $aggregatedEvents.SuccessfulLogons.Count
+        UserAccountChanges   = $aggregatedEvents.UserAccountChanges.Count
+        GroupMembershipChanges = $aggregatedEvents.GroupMembershipChanges.Count
+        UnexpectedShutdown   = $aggregatedEvents.UnexpectedShutdown.Count
+        SpecialLogon         = $aggregatedEvents.SpecialLogon.Count
+    }
+    DCsWithEventErrors = @($dcsWithEventErrors)
 }
 $payload | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonPath -Encoding UTF8
- 
+
+#endregion JSON Output
+
+#region Final Output
+
+Write-Log "=========================================" -Level OK
+Write-Log "AD Daily Health Summary Complete!" -Level OK
+Write-Log "=========================================" -Level OK
 Write-Log ("HTML : {0}" -f $htmlPath) -Level OK
 Write-Log ("CSV  : {0}" -f $dcCsv) -Level OK
 Write-Log ("CSV  : {0}" -f $groupCsv) -Level OK
+Write-Log ("CSV  : {0}" -f $eventsCsv) -Level OK
 Write-Log ("JSON : {0}" -f $jsonPath) -Level OK
- 
+Write-Log "=========================================" -Level OK
+Write-Log "Event Summary (last $EventLookbackHours hour(s)):" -Level OK
+Write-Log ("  - Account Lockouts   : {0}" -f $aggregatedEvents.AccountLockouts.Count)
+Write-Log ("  - Failed Logons      : {0}" -f $aggregatedEvents.FailedLogons.Count)
+Write-Log ("  - Successful Logons  : {0}" -f $aggregatedEvents.SuccessfulLogons.Count)
+Write-Log ("  - Group Changes      : {0}" -f $aggregatedEvents.GroupMembershipChanges.Count)
+Write-Log ("  - Unexpected Shutdown: {0}" -f $aggregatedEvents.UnexpectedShutdown.Count)
+Write-Log "=========================================" -Level OK
+
 [pscustomobject]@{
     HtmlReport = $htmlPath
     DcCsv      = $dcCsv
     GroupCsv   = $groupCsv
+    EventsCsv  = $eventsCsv
     JsonReport = $jsonPath
 }
 
-
-
-DC's should Enumerates Domain to Domain.
-We can remove Groupmemebrship focused.
-Disabled User list not needed from the script
-Need to change the Event logs window to 1hr.
-Need to Add Event ID, which server rebooted abruptly(Event ID: 7, 6008)
-Segregate the Codes in script Function wise.
+#endregion Final Output
