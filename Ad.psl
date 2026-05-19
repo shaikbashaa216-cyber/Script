@@ -130,193 +130,10 @@ function Get-SvcBadge {
     return "<span class='svc $cls'>$(HtmlSafe $Status)</span>"
 }
 
-function Get-EventBadge {
-    <#
-    .SYNOPSIS
-        Returns HTML badge for event severity
-    #>
-    param([string]$Severity)
-    $cls = switch ($Severity) {
-        'Critical' { 'event-critical' }
-        'Warning'  { 'event-warning' }
-        'Info'     { 'event-info' }
-        default    { 'event-info' }
-    }
-    return "<span class='event-badge $cls'>$(HtmlSafe $Severity)</span>"
-}
-
 
 # =============================================================================
 # SECTION 2: EVENT LOG COLLECTION FUNCTIONS
 # =============================================================================
-
-function Get-SecurityEvents {
-    <#
-    .SYNOPSIS
-        Collects security-related events from domain controllers
-    #>
-    param(
-        [string]$ComputerName,
-        [datetime]$StartTime
-    )
-    
-    $events = @()
-    
-    # Security Event IDs to collect
-    $securityEventIds = @{
-        '4740' = @{ Name = 'Account Lockout'; Severity = 'Warning' }
-        '4624' = @{ Name = 'Successful Logon'; Severity = 'Info' }
-        '4625' = @{ Name = 'Failed Logon'; Severity = 'Warning' }
-        '4634' = @{ Name = 'Logoff'; Severity = 'Info' }
-        '4647' = @{ Name = 'User Initiated Logoff'; Severity = 'Info' }
-        '4648' = @{ Name = 'Explicit Credential Logon'; Severity = 'Warning' }
-        '4720' = @{ Name = 'User Created'; Severity = 'Info' }
-        '4722' = @{ Name = 'User Enabled'; Severity = 'Info' }
-        '4725' = @{ Name = 'User Disabled'; Severity = 'Warning' }
-        '4738' = @{ Name = 'User Account Changed'; Severity = 'Info' }
-        '4723' = @{ Name = 'Password Changed'; Severity = 'Info' }
-        '4724' = @{ Name = 'Password Reset'; Severity = 'Warning' }
-        '4728' = @{ Name = 'Member Added to Global Group'; Severity = 'Warning' }
-        '4732' = @{ Name = 'Member Added to Local Group'; Severity = 'Warning' }
-        '4756' = @{ Name = 'Member Added to Universal Group'; Severity = 'Warning' }
-        '5136' = @{ Name = 'Directory Object Modified'; Severity = 'Info' }
-        '5137' = @{ Name = 'Directory Object Created'; Severity = 'Info' }
-        '5138' = @{ Name = 'Directory Object Undeleted'; Severity = 'Warning' }
-        '5139' = @{ Name = 'Directory Object Moved'; Severity = 'Info' }
-        '4719' = @{ Name = 'System Audit Policy Changed'; Severity = 'Critical' }
-        '4672' = @{ Name = 'Special Privileges Assigned'; Severity = 'Warning' }
-        '4767' = @{ Name = 'Account Unlocked'; Severity = 'Info' }
-    }
-    
-    try {
-        $filterHash = @{
-            LogName = 'Security'
-            StartTime = $StartTime
-        }
-        
-        $events = Get-WinEvent -ComputerName $ComputerName -FilterHashtable $filterHash -MaxEvents 200 -ErrorAction Stop | 
-                  Where-Object { $securityEventIds.ContainsKey([string]$_.Id) } |
-                  Select-Object -First 100 |
-                  ForEach-Object {
-                      $eventInfo = $securityEventIds[[string]$_.Id]
-                      [pscustomobject]@{
-                          SourceDC = $ComputerName
-                          EventID = $_.Id
-                          EventName = $eventInfo.Name
-                          Severity = $eventInfo.Severity
-                          TimeCreated = $_.TimeCreated
-                          Message = $_.Message -replace "`r`n", ' ' -replace "`n", ' ' | Select-Object -First 200
-                      }
-                  }
-    }
-    catch {
-        $errorMsg = $_.Exception.Message
-        Write-Log "Failed to collect security events from $ComputerName: $errorMsg" -Level WARN
-    }
-    
-    return $events
-}
-
-function Get-SystemEvents {
-    <#
-    .SYNOPSIS
-        Collects system health events from domain controllers
-    #>
-    param(
-        [string]$ComputerName,
-        [datetime]$StartTime
-    )
-    
-    $events = @()
-    
-    # System Event IDs to collect
-    $systemEventIds = @{
-        '41'   = @{ Name = 'Unexpected Shutdown (Kernel-Power)'; Severity = 'Critical'; LogName = 'System' }
-        '6008' = @{ Name = 'Unexpected Shutdown'; Severity = 'Critical'; LogName = 'System' }
-        '1074' = @{ Name = 'Planned Restart/Shutdown'; Severity = 'Info'; LogName = 'System' }
-        '1100' = @{ Name = 'Event Log Service Shutdown'; Severity = 'Warning'; LogName = 'System' }
-    }
-    
-    foreach ($eventId in $systemEventIds.Keys) {
-        try {
-            $foundEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
-                LogName = 'System'
-                ID = $eventId
-                StartTime = $StartTime
-            } -ErrorAction SilentlyContinue | Select-Object -First 10
-            foreach ($evt in $foundEvents) {
-                $eventInfo = $systemEventIds[[string]$eventId]
-                $events += [pscustomobject]@{
-                    SourceDC = $ComputerName
-                    EventID = $evt.Id
-                    EventName = $eventInfo.Name
-                    Severity = $eventInfo.Severity
-                    LogName = $eventInfo.LogName
-                    TimeCreated = $evt.TimeCreated
-                    Message = $evt.Message -replace "`r`n", ' ' -replace "`n", ' ' | Select-Object -First 200
-                }
-            }
-        }
-        catch {
-            # Silently continue for expected errors
-        }
-    }
-    
-    return $events
-}
-
-function Get-ADServiceEvents {
-    <#
-    .SYNOPSIS
-        Collects Active Directory service events
-    #>
-    param(
-        [string]$ComputerName,
-        [datetime]$StartTime
-    )
-    
-    $events = @()
-    
-    # AD Service Event IDs
-    $adEventIds = @{
-        '1000' = @{ Name = 'AD DS Started'; Severity = 'Info'; LogName = 'Directory Service' }
-        '1001' = @{ Name = 'AD DS Stopped'; Severity = 'Warning'; LogName = 'Directory Service' }
-        '1126' = @{ Name = 'Directory Service Error'; Severity = 'Critical'; LogName = 'Directory Service' }
-        '1168' = @{ Name = 'Replication Error'; Severity = 'Warning'; LogName = 'Directory Service' }
-        '1925' = @{ Name = 'Replication Failure'; Severity = 'Warning'; LogName = 'Directory Service' }
-        '1988' = @{ Name = 'Replication Latency Warning'; Severity = 'Warning'; LogName = 'Directory Service' }
-        '2042' = @{ Name = 'Replication Lingering Objects'; Severity = 'Critical'; LogName = 'Directory Service' }
-        '4013' = @{ Name = 'DNS Registration Issue'; Severity = 'Warning'; LogName = 'Directory Service' }
-    }
-    
-    foreach ($eventId in $adEventIds.Keys) {
-        try {
-            $eventInfo = $adEventIds[[string]$eventId]
-            $foundEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
-                LogName = $eventInfo.LogName
-                ID = $eventId
-                StartTime = $StartTime
-            } -ErrorAction SilentlyContinue | Select-Object -First 10
-            
-            foreach ($evt in $foundEvents) {
-                $events += [pscustomobject]@{
-                    SourceDC = $ComputerName
-                    EventID = $evt.Id
-                    EventName = $eventInfo.Name
-                    Severity = $eventInfo.Severity
-                    LogName = $eventInfo.LogName
-                    TimeCreated = $evt.TimeCreated
-                    Message = $evt.Message -replace "`r`n", ' ' -replace "`n", ' ' | Select-Object -First 200
-                }
-            }
-        }
-        catch {
-            # Silently continue for expected errors
-        }
-    }
-    
-    return $events
-}
 
 function Collect-AllEvents {
     <#
@@ -399,12 +216,17 @@ function Collect-AllEvents {
     foreach ($job in $jobs) {
         $result = $job.PS.EndInvoke($job.Handle)
         foreach ($event in $result) {
+            $eventLevel = $event.LevelDisplayName
+            if ([string]::IsNullOrEmpty($eventLevel)) {
+                $eventLevel = 'Info'
+            }
+            
             $allEvents += [pscustomobject]@{
                 SourceDC = $job.DCName
                 TimeCreated = $event.TimeCreated
                 LogName = $event.LogName
                 EventID = $event.Id
-                Level = $event.LevelDisplayName
+                Level = $eventLevel
                 Message = $event.Message -replace "`r`n", ' ' -replace "`n", ' ' | Select-Object -First 300
                 ProviderName = $event.ProviderName
             }
@@ -420,7 +242,7 @@ function Collect-AllEvents {
     $pool.Close()
     $pool.Dispose()
     
-    Write-Log "Event collection complete: Security=$($eventStats.SecurityEvents), System=$($eventStats.SystemEvents), AD=$($eventStats.ADEvents)" -Level OK
+    Write-Log ("Event collection complete: Security={0}, System={1}, AD={2}" -f $eventStats.SecurityEvents, $eventStats.SystemEvents, $eventStats.ADEvents) -Level OK
     
     return $allEvents
 }
@@ -441,71 +263,6 @@ function Test-DCConnectivity {
     }
     catch {
         return $false
-    }
-}
-
-function Get-DCServices {
-    <#
-    .SYNOPSIS
-        Gets service status for critical AD services on a DC
-    #>
-    param(
-        [string]$ComputerName,
-        [bool]$IsReachable
-    )
-    
-    $services = @{ NTDS = 'Unknown'; Netlogon = 'Unknown'; KDC = 'Unknown'; DFSR = 'Unknown'; DNS = 'Unknown' }
-    
-    if (-not $IsReachable) {
-        return $services
-    }
-    
-    try {
-        $serviceList = @(Get-Service -ComputerName $ComputerName -Name NTDS, Netlogon, KDC, DFSR, DNS -ErrorAction Stop)
-        foreach ($s in $serviceList) {
-            $services[[string]$s.Name] = [string]$s.Status
-        }
-    }
-    catch {
-        $errorMsg = $_.Exception.Message
-        Write-Log "Failed to get services from $ComputerName: $errorMsg" -Level WARN
-    }
-    
-    return $services
-}
-
-function Check-DCHealth {
-    <#
-    .SYNOPSIS
-        Comprehensive health check for a single domain controller
-    #>
-    param(
-        [string]$HostName,
-        [string]$Domain,
-        [string]$Site,
-        [string]$IPv4
-    )
-    
-    $reachable = Test-DCConnectivity -ComputerName $HostName
-    $services = Get-DCServices -ComputerName $HostName -IsReachable $reachable
-    
-    $anyBad = @($services.Values | Where-Object { $_ -notin @('Running', 'Unknown') })
-    $dcStatus = if (-not $reachable) { 'Red' } 
-                elseif ($anyBad.Count -gt 0) { 'Yellow' } 
-                else { 'Green' }
-    
-    return [pscustomobject]@{
-        Domain      = $Domain
-        HostName    = $HostName
-        Site        = $Site
-        IPv4Address = $IPv4
-        Reachable   = $reachable
-        NTDS        = $services['NTDS']
-        Netlogon    = $services['Netlogon']
-        KDC         = $services['KDC']
-        DFSR        = $services['DFSR']
-        DNS         = $services['DNS']
-        DcStatus    = $dcStatus
     }
 }
 
@@ -579,14 +336,14 @@ function Collect-DCHealthParallel {
         $job.PS.Dispose()
         $done++
         if ($done % 20 -eq 0 -or $done -eq $jobs.Count) {
-            Write-Log "Progress: $done/$($jobs.Count) DCs collected." -Level INFO
+            Write-Log ("Progress: {0}/{1} DCs collected." -f $done, $jobs.Count) -Level INFO
         }
     }
     
     $pool.Close()
     $pool.Dispose()
     
-    Write-Log "Parallel collection complete. $($dcRows.Count) results." -Level OK
+    Write-Log ("Parallel collection complete. {0} results." -f $dcRows.Count) -Level OK
     return $dcRows
 }
 
@@ -865,7 +622,7 @@ function Build-DCSiteSectionsHtml {
         $block += "<span class='dc-count'>$dcCountText</span>"
         $block += "<span class='toggle-hint'>(click to expand)</span></div>"
         $block += "<div id='site-$safeId' class='site-table' style='display:none'>"
-        $block += "<td><thead>"
+        $block += "<table><thead>"
         $block += "<tr><th>Domain Controller</th><th>IP Address</th><th>Reachable</th>"
         $block += "<th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></tr>"
         $block += "</thead><tbody>$rows</tbody></table></div></div>"
@@ -892,7 +649,7 @@ function Build-EventsHtml {
     
     $sortedEvents = $Events | Sort-Object { $severityOrder[[string]$_.Level] }, TimeCreated -Descending
     
-    $html = "<tr><thead>"
+    $html = "<thead>"
     $html += "<tr><th>Time</th><th>Source DC</th><th>Event ID</th><th>Log</th><th>Severity</th><th>Message</th></tr>"
     $html += "</thead><tbody>"
     
@@ -915,7 +672,12 @@ function Build-EventsHtml {
         $html += "<td>$($event.EventID)</td>"
         $html += "<td>$(HtmlSafe $event.LogName)</td>"
         $html += "<td><span class='event-badge $severityClass'>$(HtmlSafe $event.Level)</span></td>"
-        $html += "<td><div class='event-message'>$(HtmlSafe ($event.Message | Select-Object -First 150))</div></td>"
+        
+        $shortMessage = $event.Message
+        if ($shortMessage.Length -gt 150) {
+            $shortMessage = $shortMessage.Substring(0, 150) + "..."
+        }
+        $html += "<td><div class='event-message'>$(HtmlSafe $shortMessage)</div></td>"
         $html += "</tr>"
         $count++
     }
@@ -1045,7 +807,7 @@ Write-Log "Exported DC CSV: $dcCsv" -Level OK
 Write-Log "Exported Events CSV: $eventCsv" -Level OK
 
 # Generate HTML content
-$htmlContent = @'
+$htmlContent = @"
 <!DOCTYPE html>
 <html lang='en'>
 <head>
@@ -1179,10 +941,6 @@ pre {
 </head>
 <body>
 
-'@
-
-# Add header panel
-$htmlContent += @"
 <div class='panel'>
 <h1>🏥 Active Directory Daily Health Summary</h1>
 <div class='meta'>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</div>
@@ -1190,10 +948,6 @@ $htmlContent += @"
 <div class='meta'>Event Lookback: $EventLookbackHours hour(s) | Collection Mode: $(if ($DemoMode) { 'Demo' } else { 'Production' })</div>
 </div>
 
-"@
-
-# Add summary cards
-$htmlContent += @"
 <div class='cards'>
 <div class='card'><div class='k'>Overall Health</div><div class='v'><span class='badge badge-$($healthStatus.ToLowerInvariant())'>$(HtmlSafe $healthStatus)</span></div></div>
 <div class='card'><div class='k'>Domain Controllers</div><div class='v'>$($dcRows.Count)</div></div>
@@ -1208,10 +962,6 @@ $htmlContent += @"
 <div class='esc esc-$($healthStatus.ToLowerInvariant())'>$(HtmlSafe $escalationGuidance)</div>
 </div>
 
-"@
-
-# Add site health overview
-$htmlContent += @"
 <div class='panel'>
 <h2>🌐 Site Health Overview</h2>
 <div class='meta'>One box per AD site. Red = unreachable DC. Yellow = service degradation. Green = all healthy.</div>
@@ -1220,10 +970,6 @@ $siteCardsHtml
 </div>
 </div>
 
-"@
-
-# Add priority issues
-$htmlContent += @"
 <div class='panel'>
 <h2>⚠️ Priority Issues</h2>
 <div class='table-wrapper'>
@@ -1238,10 +984,6 @@ $priorityHtml
 </div>
 </div>
 
-"@
-
-# Add event log summary
-$htmlContent += @"
 <div class='panel'>
 <h2>📋 Security & System Events (Last $EventLookbackHours Hours)</h2>
 $eventStatsHtml
@@ -1253,10 +995,6 @@ $eventsHtml
 <div class='meta' style='margin-top: 10px;'>Full event list exported to CSV: $(Split-Path $eventCsv -Leaf)</div>
 </div>
 
-"@
-
-# Add FSMO roles
-$htmlContent += @"
 <div class='panel'>
 <h2>👑 FSMO Role Holders</h2>
 <div class='table-wrapper'>
@@ -1267,10 +1005,6 @@ $htmlContent += @"
 </div>
 </div>
 
-"@
-
-# Add replication failures
-$htmlContent += @"
 <div class='panel'>
 <h2>🔄 Replication Failures</h2>
 <div class='table-wrapper'>
@@ -1281,19 +1015,11 @@ $htmlContent += @"
 </div>
 </div>
 
-"@
-
-# Add replication summary
-$htmlContent += @"
 <div class='panel'>
 <h2>📊 Replication Summary (repadmin /replsummary)</h2>
 <pre>$(HtmlSafe $replText)</pre>
 </div>
 
-"@
-
-# Add all domain controllers by site
-$htmlContent += @"
 <div class='panel'>
 <h2>🖥️ All Domain Controllers by Site</h2>
 <div class='meta'>$($dcRows.Count) DCs across $($siteStats.Count) sites. Click any site header to expand. Use search to filter.</div>
@@ -1301,10 +1027,6 @@ $htmlContent += @"
 $siteGroupHtml
 </div>
 
-"@
-
-# Add footer
-$htmlContent += @"
 <div class='panel'>
 <div class='meta' style='text-align: center;'>
 <strong>Output Files:</strong><br/>
