@@ -164,44 +164,27 @@ function Get-SecurityEvents {
     
     # Security Event IDs to collect
     $securityEventIds = @{
-        # Account Lockouts
         '4740' = @{ Name = 'Account Lockout'; Severity = 'Warning' }
-        
-        # Logon Events
         '4624' = @{ Name = 'Successful Logon'; Severity = 'Info' }
         '4625' = @{ Name = 'Failed Logon'; Severity = 'Warning' }
         '4634' = @{ Name = 'Logoff'; Severity = 'Info' }
         '4647' = @{ Name = 'User Initiated Logoff'; Severity = 'Info' }
         '4648' = @{ Name = 'Explicit Credential Logon'; Severity = 'Warning' }
-        
-        # User Account Management
         '4720' = @{ Name = 'User Created'; Severity = 'Info' }
         '4722' = @{ Name = 'User Enabled'; Severity = 'Info' }
         '4725' = @{ Name = 'User Disabled'; Severity = 'Warning' }
         '4738' = @{ Name = 'User Account Changed'; Severity = 'Info' }
-        
-        # Password Management
         '4723' = @{ Name = 'Password Changed'; Severity = 'Info' }
         '4724' = @{ Name = 'Password Reset'; Severity = 'Warning' }
-        
-        # Group Membership Changes
         '4728' = @{ Name = 'Member Added to Global Group'; Severity = 'Warning' }
         '4732' = @{ Name = 'Member Added to Local Group'; Severity = 'Warning' }
         '4756' = @{ Name = 'Member Added to Universal Group'; Severity = 'Warning' }
-        
-        # Directory Service Changes
         '5136' = @{ Name = 'Directory Object Modified'; Severity = 'Info' }
         '5137' = @{ Name = 'Directory Object Created'; Severity = 'Info' }
         '5138' = @{ Name = 'Directory Object Undeleted'; Severity = 'Warning' }
         '5139' = @{ Name = 'Directory Object Moved'; Severity = 'Info' }
-        
-        # Audit Policy Changes
         '4719' = @{ Name = 'System Audit Policy Changed'; Severity = 'Critical' }
-        
-        # Privilege Assignment
         '4672' = @{ Name = 'Special Privileges Assigned'; Severity = 'Warning' }
-        
-        # Account Unlock
         '4767' = @{ Name = 'Account Unlocked'; Severity = 'Info' }
     }
     
@@ -222,12 +205,13 @@ function Get-SecurityEvents {
                           EventName = $eventInfo.Name
                           Severity = $eventInfo.Severity
                           TimeCreated = $_.TimeCreated
-                          Message = $_.Message -replace '[\r\n]+', ' ' | Select-Object -First 200
+                          Message = $_.Message -replace "`r`n", ' ' -replace "`n", ' ' | Select-Object -First 200
                       }
                   }
     }
     catch {
-        Write-Log "Failed to collect security events from $ComputerName: $($_.Exception.Message)" -Level WARN
+        $errorMsg = $_.Exception.Message
+        Write-Log "Failed to collect security events from $ComputerName: $errorMsg" -Level WARN
     }
     
     return $events
@@ -247,7 +231,7 @@ function Get-SystemEvents {
     
     # System Event IDs to collect
     $systemEventIds = @{
-        '41'  = @{ Name = 'Unexpected Shutdown (Kernel-Power)'; Severity = 'Critical'; LogName = 'System' }
+        '41'   = @{ Name = 'Unexpected Shutdown (Kernel-Power)'; Severity = 'Critical'; LogName = 'System' }
         '6008' = @{ Name = 'Unexpected Shutdown'; Severity = 'Critical'; LogName = 'System' }
         '1074' = @{ Name = 'Planned Restart/Shutdown'; Severity = 'Info'; LogName = 'System' }
         '1100' = @{ Name = 'Event Log Service Shutdown'; Severity = 'Warning'; LogName = 'System' }
@@ -255,24 +239,27 @@ function Get-SystemEvents {
     
     foreach ($eventId in $systemEventIds.Keys) {
         try {
-            $events += Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
+            $foundEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
                 LogName = 'System'
                 ID = $eventId
                 StartTime = $StartTime
-            } -ErrorAction SilentlyContinue | Select-Object -First 10 | ForEach-Object {
+            } -ErrorAction SilentlyContinue | Select-Object -First 10
+            foreach ($evt in $foundEvents) {
                 $eventInfo = $systemEventIds[[string]$eventId]
-                [pscustomobject]@{
+                $events += [pscustomobject]@{
                     SourceDC = $ComputerName
-                    EventID = $_.Id
+                    EventID = $evt.Id
                     EventName = $eventInfo.Name
                     Severity = $eventInfo.Severity
                     LogName = $eventInfo.LogName
-                    TimeCreated = $_.TimeCreated
-                    Message = $_.Message -replace '[\r\n]+', ' ' | Select-Object -First 200
+                    TimeCreated = $evt.TimeCreated
+                    Message = $evt.Message -replace "`r`n", ' ' -replace "`n", ' ' | Select-Object -First 200
                 }
             }
         }
-        catch {}
+        catch {
+            # Silently continue for expected errors
+        }
     }
     
     return $events
@@ -304,24 +291,28 @@ function Get-ADServiceEvents {
     
     foreach ($eventId in $adEventIds.Keys) {
         try {
-            $events += Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
-                LogName = $adEventIds[[string]$eventId].LogName
+            $eventInfo = $adEventIds[[string]$eventId]
+            $foundEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
+                LogName = $eventInfo.LogName
                 ID = $eventId
                 StartTime = $StartTime
-            } -ErrorAction SilentlyContinue | Select-Object -First 10 | ForEach-Object {
-                $eventInfo = $adEventIds[[string]$eventId]
-                [pscustomobject]@{
+            } -ErrorAction SilentlyContinue | Select-Object -First 10
+            
+            foreach ($evt in $foundEvents) {
+                $events += [pscustomobject]@{
                     SourceDC = $ComputerName
-                    EventID = $_.Id
+                    EventID = $evt.Id
                     EventName = $eventInfo.Name
                     Severity = $eventInfo.Severity
                     LogName = $eventInfo.LogName
-                    TimeCreated = $_.TimeCreated
-                    Message = $_.Message -replace '[\r\n]+', ' ' | Select-Object -First 200
+                    TimeCreated = $evt.TimeCreated
+                    Message = $evt.Message -replace "`r`n", ' ' -replace "`n", ' ' | Select-Object -First 200
                 }
             }
         }
-        catch {}
+        catch {
+            # Silently continue for expected errors
+        }
     }
     
     return $events
@@ -414,7 +405,7 @@ function Collect-AllEvents {
                 LogName = $event.LogName
                 EventID = $event.Id
                 Level = $event.LevelDisplayName
-                Message = $event.Message -replace '[\r\n]+', ' ' | Select-Object -First 300
+                Message = $event.Message -replace "`r`n", ' ' -replace "`n", ' ' | Select-Object -First 300
                 ProviderName = $event.ProviderName
             }
             
@@ -476,7 +467,8 @@ function Get-DCServices {
         }
     }
     catch {
-        Write-Log "Failed to get services from $ComputerName: $($_.Exception.Message)" -Level WARN
+        $errorMsg = $_.Exception.Message
+        Write-Log "Failed to get services from $ComputerName: $errorMsg" -Level WARN
     }
     
     return $services
@@ -609,8 +601,8 @@ function Get-FSMORoleStatus {
         Gets FSMO role holders and their reachability status
     #>
     param(
-        [Microsoft.ActiveDirectory.Management.ADDomain]$Domain,
-        [Microsoft.ActiveDirectory.Management.ADForest]$Forest
+        $Domain,
+        $Forest
     )
     
     $fsmoMap = [ordered]@{
@@ -657,7 +649,8 @@ function Get-ReplicationFailures {
         }
     }
     catch {
-        Write-Log "Get-ADReplicationFailure failed: $($_.Exception.Message)" -Level WARN
+        $errorMsg = $_.Exception.Message
+        Write-Log "Get-ADReplicationFailure failed: $errorMsg" -Level WARN
     }
     
     return $replFailureRows
@@ -679,7 +672,8 @@ function Get-ReplicationSummaryText {
             }
         }
         catch {
-            $replText = "repadmin failed: $($_.Exception.Message)"
+            $errorMsg = $_.Exception.Message
+            $replText = "repadmin failed: $errorMsg"
         }
     }
     elseif (-not $IncludeReplicationText) {
@@ -871,9 +865,9 @@ function Build-DCSiteSectionsHtml {
         $block += "<span class='dc-count'>$dcCountText</span>"
         $block += "<span class='toggle-hint'>(click to expand)</span></div>"
         $block += "<div id='site-$safeId' class='site-table' style='display:none'>"
-        $block += "<table><thead>"
-        $block += "<th>Domain Controller</th><th>IP Address</th><th>Reachable</th>"
-        $block += "<th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th>"
+        $block += "<td><thead>"
+        $block += "<tr><th>Domain Controller</th><th>IP Address</th><th>Reachable</th>"
+        $block += "<th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></tr>"
         $block += "</thead><tbody>$rows</tbody></table></div></div>"
         
         $block
@@ -898,8 +892,8 @@ function Build-EventsHtml {
     
     $sortedEvents = $Events | Sort-Object { $severityOrder[[string]$_.Level] }, TimeCreated -Descending
     
-    $html = "<td><thead>"
-    $html += "<th>Time</th><th>Source DC</th><th>Event ID</th><th>Log</th><th>Severity</th><th>Message</th>"
+    $html = "<tr><thead>"
+    $html += "<tr><th>Time</th><th>Source DC</th><th>Event ID</th><th>Log</th><th>Severity</th><th>Message</th></tr>"
     $html += "</thead><tbody>"
     
     $count = 0
@@ -1050,14 +1044,14 @@ $allEvents | Export-Csv -Path $eventCsv -NoTypeInformation -Encoding UTF8
 Write-Log "Exported DC CSV: $dcCsv" -Level OK
 Write-Log "Exported Events CSV: $eventCsv" -Level OK
 
-# Generate HTML
-$html = @"
+# Generate HTML content
+$htmlContent = @'
 <!DOCTYPE html>
 <html lang='en'>
 <head>
 <meta charset='UTF-8' />
 <meta name='viewport' content='width=device-width, initial-scale=1.0' />
-<title>AD Daily Health Summary - $(HtmlSafe $domain.DNSRoot)</title>
+<title>AD Daily Health Summary</title>
 <style>
 :root { 
     --bg1:#eaf3ff; 
@@ -1181,30 +1175,25 @@ pre {
     font-size: 12px; 
     line-height: 1.5; 
 }
-code { 
-    background: #eff6ff; 
-    border: 1px solid #bfdbfe; 
-    border-radius: 6px; 
-    padding: 2px 6px; 
-    color: #1e3a8a; 
-    font-family: Consolas, monospace; 
-    font-size: 12px; 
-}
-.cmd-list { margin: 8px 0 0 18px; }
-.cmd-list li { margin: 5px 0; }
 </style>
 </head>
 <body>
 
-<!-- Header Panel -->
+'@
+
+# Add header panel
+$htmlContent += @"
 <div class='panel'>
 <h1>🏥 Active Directory Daily Health Summary</h1>
-<div class='meta'>Generated: $(HtmlSafe (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))</div>
+<div class='meta'>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</div>
 <div class='meta'>Domain: $(HtmlSafe $domain.DNSRoot) | Forest: $(HtmlSafe $forest.Name) | Domain Controllers: $($dcRows.Count) | AD Sites: $($siteStats.Count)</div>
 <div class='meta'>Event Lookback: $EventLookbackHours hour(s) | Collection Mode: $(if ($DemoMode) { 'Demo' } else { 'Production' })</div>
 </div>
 
-<!-- Summary Cards -->
+"@
+
+# Add summary cards
+$htmlContent += @"
 <div class='cards'>
 <div class='card'><div class='k'>Overall Health</div><div class='v'><span class='badge badge-$($healthStatus.ToLowerInvariant())'>$(HtmlSafe $healthStatus)</span></div></div>
 <div class='card'><div class='k'>Domain Controllers</div><div class='v'>$($dcRows.Count)</div></div>
@@ -1215,12 +1204,14 @@ code {
 <div class='card'><div class='k'>FSMO Issues</div><div class='v'>$fsmoDown</div></div>
 </div>
 
-<!-- Escalation Guidance -->
 <div class='panel'>
 <div class='esc esc-$($healthStatus.ToLowerInvariant())'>$(HtmlSafe $escalationGuidance)</div>
 </div>
 
-<!-- Site Health Overview -->
+"@
+
+# Add site health overview
+$htmlContent += @"
 <div class='panel'>
 <h2>🌐 Site Health Overview</h2>
 <div class='meta'>One box per AD site. Red = unreachable DC. Yellow = service degradation. Green = all healthy.</div>
@@ -1229,13 +1220,16 @@ $siteCardsHtml
 </div>
 </div>
 
-<!-- Priority Issues -->
+"@
+
+# Add priority issues
+$htmlContent += @"
 <div class='panel'>
 <h2>⚠️ Priority Issues</h2>
 <div class='table-wrapper'>
 <table>
 <thead>
-<th>Site</th><th>Domain Controller</th><th>IP</th><th>Reachable</th><th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th>
+<tr><th>Site</th><th>Domain Controller</th><th>IP</th><th>Reachable</th><th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></tr>
 </thead>
 <tbody>
 $priorityHtml
@@ -1244,7 +1238,10 @@ $priorityHtml
 </div>
 </div>
 
-<!-- Event Log Summary -->
+"@
+
+# Add event log summary
+$htmlContent += @"
 <div class='panel'>
 <h2>📋 Security & System Events (Last $EventLookbackHours Hours)</h2>
 $eventStatsHtml
@@ -1256,35 +1253,47 @@ $eventsHtml
 <div class='meta' style='margin-top: 10px;'>Full event list exported to CSV: $(Split-Path $eventCsv -Leaf)</div>
 </div>
 
-<!-- FSMO Roles -->
+"@
+
+# Add FSMO roles
+$htmlContent += @"
 <div class='panel'>
 <h2>👑 FSMO Role Holders</h2>
 <div class='table-wrapper'>
 <table>
-<thead><th>Role</th><th>Holder</th><th>Status</th></thead>
+<thead><tr><th>Role</th><th>Holder</th><th>Status</th></tr></thead>
 <tbody>$fsmoHtml</tbody>
 </table>
 </div>
 </div>
 
-<!-- Replication Failures -->
+"@
+
+# Add replication failures
+$htmlContent += @"
 <div class='panel'>
 <h2>🔄 Replication Failures</h2>
 <div class='table-wrapper'>
 <table>
-<thead><th>Server</th><th>Partner</th><th>Last Error</th><th>Failure Count</th><th>First Failure</th><th>Last Failure</th></thead>
+<thead><tr><th>Server</th><th>Partner</th><th>Last Error</th><th>Failure Count</th><th>First Failure</th><th>Last Failure</th></tr></thead>
 <tbody>$replFailHtml</tbody>
 </table>
 </div>
 </div>
 
-<!-- Replication Summary -->
+"@
+
+# Add replication summary
+$htmlContent += @"
 <div class='panel'>
 <h2>📊 Replication Summary (repadmin /replsummary)</h2>
 <pre>$(HtmlSafe $replText)</pre>
 </div>
 
-<!-- All Domain Controllers by Site -->
+"@
+
+# Add all domain controllers by site
+$htmlContent += @"
 <div class='panel'>
 <h2>🖥️ All Domain Controllers by Site</h2>
 <div class='meta'>$($dcRows.Count) DCs across $($siteStats.Count) sites. Click any site header to expand. Use search to filter.</div>
@@ -1292,7 +1301,10 @@ $eventsHtml
 $siteGroupHtml
 </div>
 
-<!-- Footer -->
+"@
+
+# Add footer
+$htmlContent += @"
 <div class='panel'>
 <div class='meta' style='text-align: center;'>
 <strong>Output Files:</strong><br/>
@@ -1328,7 +1340,7 @@ function filterDCs(val) {
 "@
 
 # Save HTML file
-[System.IO.File]::WriteAllText($htmlPath, $html, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($htmlPath, $htmlContent, [System.Text.Encoding]::UTF8)
 
 # Save JSON payload
 $jsonPayload = [pscustomobject]@{
