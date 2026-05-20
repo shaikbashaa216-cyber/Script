@@ -4,15 +4,7 @@
     
 .DESCRIPTION
     Performs daily health checks on Active Directory including DC health, FSMO roles,
-    replication status, and critical security event log analysis. Outputs HTML dashboard
-    with the same color scheme and visual style as the original script.
-    
-    Features:
-    - Parallel DC health collection for large environments
-    - Security event monitoring (failed logons, privilege changes, audit changes)
-    - System health events (unexpected shutdowns, service issues)
-    - HTML dashboard with site-based organization and search
-    - CSV/JSON exports for further analysis
+    replication status, and critical security event log analysis. Outputs HTML dashboard.
     
     Monitored Event IDs:
     - 4625: Failed logon (wrong passwords, expired accounts, password-spraying)
@@ -47,8 +39,8 @@ param(
     [int]$DemoDomainControllerLimit = 3,
     
     [Parameter(Mandatory = $false)]
-    [ValidateRange(1, 50)]
-    [int]$MaxConcurrency = 25,
+    [ValidateRange(1, 20)]
+    [int]$MaxConcurrency = 10,
     
     [Parameter(Mandatory = $false)]
     [ValidateRange(1, 168)]
@@ -58,15 +50,15 @@ param(
     [switch]$SkipEventLogs
 )
 
+# Set strict error handling - DO NOT EXIT ON ERRORS
+$ErrorActionPreference = 'Continue'
+$WarningPreference = 'SilentlyContinue'
+
 # =============================================================================
 # SECTION 1: LOGGING AND UTILITY FUNCTIONS
 # =============================================================================
 
 function Write-Log {
-    <#
-    .SYNOPSIS
-        Writes timestamped log messages to console
-    #>
     param(
         [string]$Message,
         [string]$Level = 'INFO'
@@ -82,10 +74,6 @@ function Write-Log {
 }
 
 function Write-HealthRunbook {
-    <#
-    .SYNOPSIS
-        Displays the runbook/usage information
-    #>
     $lines = @(
         '═══════════════════════════════════════════════════════════════════════════════',
         '                    AD Daily Health Summary Runbook',
@@ -98,7 +86,7 @@ function Write-HealthRunbook {
         '  powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -OutputDirectory D:\Reports\ADHealth',
         '',
         'Large environment (faster parallel collection):',
-        '  powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -MaxConcurrency 30',
+        '  powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -MaxConcurrency 15',
         '',
         'Extend event lookback period:',
         '  powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -EventLookbackHours 48',
@@ -118,20 +106,17 @@ function Write-HealthRunbook {
 }
 
 function HtmlSafe {
-    <#
-    .SYNOPSIS
-        HTML-encodes a string for safe output
-    #>
     param([object]$Value)
     if ($null -eq $Value) { return '' }
-    return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+    try {
+        return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+    }
+    catch {
+        return ''
+    }
 }
 
 function Get-SvcBadge {
-    <#
-    .SYNOPSIS
-        Returns HTML badge for service status
-    #>
     param([string]$Status)
     $cls = if ($Status -eq 'Running') { 'svc-ok' } 
            elseif ($Status -eq 'Unknown') { 'svc-unk' } 
@@ -141,239 +126,245 @@ function Get-SvcBadge {
 
 
 # =============================================================================
-# SECTION 2: EVENT LOG COLLECTION FUNCTIONS
-# =============================================================================
-
-function Collect-AllEvents {
-    <#
-    .SYNOPSIS
-        Collects specified event types from domain controllers
-        Monitored Events: 4625, 4719, 4672, 4648, 1100, 6008, 1074
-    #>
-    param(
-        [array]$DomainControllers,
-        [datetime]$StartTime,
-        [int]$MaxConcurrency
-    )
-    
-    $allEvents = @()
-    $eventStats = @{
-        SecurityEvents = 0
-        SystemEvents = 0
-    }
-    
-    Write-Log "Collecting event logs from $($DomainControllers.Count) domain controllers..." -Level OK
-    
-    # Define event details
-    $eventDetails = @{
-        '4625' = @{ Name = 'Failed Logon'; Severity = 'Warning'; LogName = 'Security'; Description = 'Wrong password, expired account, or potential password-spraying attack' }
-        '4719' = @{ Name = 'System Audit Policy Modified'; Severity = 'Critical'; LogName = 'Security'; Description = 'Security auditing settings were modified' }
-        '4672' = @{ Name = 'Special Privileges Assigned'; Severity = 'Warning'; LogName = 'Security'; Description = 'Admin privileges assigned to new logon (e.g., Administrator login)' }
-        '4648' = @{ Name = 'Explicit Credential Logon'; Severity = 'Warning'; LogName = 'Security'; Description = 'Logon attempted using explicit credentials' }
-        '1100' = @{ Name = 'Event Log Service Shutdown'; Severity = 'Warning'; LogName = 'System'; Description = 'The event logging service has shut down' }
-        '6008' = @{ Name = 'Unexpected Shutdown'; Severity = 'Critical'; LogName = 'System'; Description = 'Previous system shutdown was unexpected' }
-        '1074' = @{ Name = 'Planned Restart/Shutdown'; Severity = 'Info'; LogName = 'System'; Description = 'Planned restart or shutdown initiated by application or user' }
-    }
-    
-    $eventScript = {
-        param($ComputerName, $StartTime, $EventDetails)
-        
-        $events = @()
-        
-        # Security events (4625, 4719, 4672, 4648)
-        $securityEventIds = @('4625', '4719', '4672', '4648')
-        try {
-            $securityEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
-                LogName = 'Security'
-                ID = $securityEventIds
-                StartTime = $StartTime
-            } -MaxEvents 200 -ErrorAction SilentlyContinue
-            
-            foreach ($evt in $securityEvents) {
-                $evtId = [string]$evt.Id
-                $details = $EventDetails[$evtId]
-                $events += [pscustomobject]@{
-                    EventID = $evtId
-                    EventName = $details.Name
-                    Severity = $details.Severity
-                    LogName = 'Security'
-                    TimeCreated = $evt.TimeCreated
-                    Message = $evt.Message -replace "`r`n", ' ' -replace "`n", ' ' | Select-Object -First 300
-                    Description = $details.Description
-                }
-            }
-        }
-        catch { }
-        
-        # System events (1100, 6008, 1074)
-        $systemEventIds = @('1100', '6008', '1074')
-        try {
-            $systemEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
-                LogName = 'System'
-                ID = $systemEventIds
-                StartTime = $StartTime
-            } -MaxEvents 200 -ErrorAction SilentlyContinue
-            
-            foreach ($evt in $systemEvents) {
-                $evtId = [string]$evt.Id
-                $details = $EventDetails[$evtId]
-                $events += [pscustomobject]@{
-                    EventID = $evtId
-                    EventName = $details.Name
-                    Severity = $details.Severity
-                    LogName = 'System'
-                    TimeCreated = $evt.TimeCreated
-                    Message = $evt.Message -replace "`r`n", ' ' -replace "`n", ' ' | Select-Object -First 300
-                    Description = $details.Description
-                }
-            }
-        }
-        catch { }
-        
-        return $events
-    }
-    
-    $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $MaxConcurrency)
-    $pool.Open()
-    
-    $jobs = @()
-    foreach ($dc in $DomainControllers) {
-        $ps = [System.Management.Automation.PowerShell]::Create()
-        $ps.RunspacePool = $pool
-        [void]$ps.AddScript($eventScript)
-        [void]$ps.AddArgument($dc.HostName)
-        [void]$ps.AddArgument($StartTime)
-        [void]$ps.AddArgument($eventDetails)
-        $jobs += [pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke(); DCName = $dc.HostName }
-    }
-    
-    foreach ($job in $jobs) {
-        $result = $job.PS.EndInvoke($job.Handle)
-        foreach ($event in $result) {
-            $allEvents += [pscustomobject]@{
-                SourceDC = $job.DCName
-                TimeCreated = $event.TimeCreated
-                LogName = $event.LogName
-                EventID = $event.EventID
-                EventName = $event.EventName
-                Severity = $event.Severity
-                Description = $event.Description
-                Message = $event.Message
-            }
-            
-            # Update stats
-            if ($event.LogName -eq 'Security') { $eventStats.SecurityEvents++ }
-            elseif ($event.LogName -eq 'System') { $eventStats.SystemEvents++ }
-        }
-        $job.PS.Dispose()
-    }
-    
-    $pool.Close()
-    $pool.Dispose()
-    
-    Write-Log ("Event collection complete: Security={0}, System={1}" -f $eventStats.SecurityEvents, $eventStats.SystemEvents) -Level OK
-    
-    return $allEvents
-}
-
-
-# =============================================================================
-# SECTION 3: DOMAIN CONTROLLER HEALTH FUNCTIONS
+# SECTION 2: DOMAIN CONTROLLER HEALTH FUNCTIONS (Synchronous - More Stable)
 # =============================================================================
 
 function Test-DCConnectivity {
-    <#
-    .SYNOPSIS
-        Tests basic connectivity to a domain controller
-    #>
     param([string]$ComputerName)
     try {
-        return [bool](Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction Stop)
+        return [bool](Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction Stop -TimeoutSeconds 5)
     }
     catch {
         return $false
     }
 }
 
-function Collect-DCHealthParallel {
-    <#
-    .SYNOPSIS
-        Collects health status for all DCs in parallel
-    #>
+function Get-DCServices {
     param(
-        [array]$DomainControllers,
-        [int]$MaxConcurrency
+        [string]$ComputerName,
+        [bool]$IsReachable
     )
     
-    Write-Log "Starting parallel health collection: $($DomainControllers.Count) DCs, max concurrency $MaxConcurrency..." -Level OK
+    $services = @{ NTDS = 'Unknown'; Netlogon = 'Unknown'; KDC = 'Unknown'; DFSR = 'Unknown'; DNS = 'Unknown' }
     
-    $dcCheckScript = {
-        param($HostName, $Domain, $Site, $IPv4)
-        
-        $reachable = $false
-        try { $reachable = [bool](Test-Connection -ComputerName $HostName -Count 1 -Quiet -ErrorAction Stop) }
-        catch { $reachable = $false }
-        
-        $svc = @{ NTDS = 'Unknown'; Netlogon = 'Unknown'; KDC = 'Unknown'; DFSR = 'Unknown'; DNS = 'Unknown' }
-        
-        if ($reachable) {
-            try {
-                $services = @(Get-Service -ComputerName $HostName -Name NTDS, Netlogon, KDC, DFSR, DNS -ErrorAction Stop)
-                foreach ($s in $services) { $svc[[string]$s.Name] = [string]$s.Status }
-            }
-            catch { }
+    if (-not $IsReachable) {
+        return $services
+    }
+    
+    $serviceNames = @('NTDS', 'Netlogon', 'KDC', 'DFSR', 'DNS')
+    foreach ($serviceName in $serviceNames) {
+        try {
+            $svc = Get-Service -ComputerName $ComputerName -Name $serviceName -ErrorAction Stop
+            $services[$serviceName] = $svc.Status.ToString()
         }
-        
-        $anyBad = @($svc.Values | Where-Object { $_ -notin @('Running', 'Unknown') })
-        $dcStatus = if (-not $reachable) { 'Red' } elseif ($anyBad.Count -gt 0) { 'Yellow' } else { 'Green' }
-        
-        [pscustomobject]@{
-            Domain      = $Domain
-            HostName    = $HostName
-            Site        = $Site
-            IPv4Address = $IPv4
-            Reachable   = $reachable
-            NTDS        = $svc['NTDS']
-            Netlogon    = $svc['Netlogon']
-            KDC         = $svc['KDC']
-            DFSR        = $svc['DFSR']
-            DNS         = $svc['DNS']
-            DcStatus    = $dcStatus
+        catch {
+            # Keep as Unknown
         }
     }
     
-    $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $MaxConcurrency)
-    $pool.Open()
+    return $services
+}
+
+function Check-DCHealth {
+    param(
+        [string]$HostName,
+        [string]$Domain,
+        [string]$Site,
+        [string]$IPv4
+    )
     
-    $jobs = @()
-    foreach ($dc in $DomainControllers) {
-        $ps = [System.Management.Automation.PowerShell]::Create()
-        $ps.RunspacePool = $pool
-        [void]$ps.AddScript($dcCheckScript)
-        [void]$ps.AddArgument([string]$dc.HostName)
-        [void]$ps.AddArgument([string]$dc.Domain)
-        [void]$ps.AddArgument([string]$dc.Site)
-        [void]$ps.AddArgument([string]$dc.IPv4Address)
-        $jobs += [pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke() }
+    $reachable = Test-DCConnectivity -ComputerName $HostName
+    $services = Get-DCServices -ComputerName $HostName -IsReachable $reachable
+    
+    $anyBad = $false
+    foreach ($svcStatus in $services.Values) {
+        if ($svcStatus -ne 'Running' -and $svcStatus -ne 'Unknown') {
+            $anyBad = $true
+            break
+        }
     }
+    
+    $dcStatus = if (-not $reachable) { 'Red' } 
+                elseif ($anyBad) { 'Yellow' } 
+                else { 'Green' }
+    
+    return [pscustomobject]@{
+        Domain      = $Domain
+        HostName    = $HostName
+        Site        = $Site
+        IPv4Address = $IPv4
+        Reachable   = $reachable
+        NTDS        = $services['NTDS']
+        Netlogon    = $services['Netlogon']
+        KDC         = $services['KDC']
+        DFSR        = $services['DFSR']
+        DNS         = $services['DNS']
+        DcStatus    = $dcStatus
+    }
+}
+
+function Collect-DCHealth {
+    param(
+        [array]$DomainControllers
+    )
+    
+    Write-Log "Collecting health for $($DomainControllers.Count) domain controllers..." -Level OK
     
     $dcRows = @()
-    $done = 0
-    foreach ($job in $jobs) {
-        $result = $job.PS.EndInvoke($job.Handle)
-        if ($null -ne $result) { $dcRows += $result }
-        $job.PS.Dispose()
-        $done++
-        if ($done % 20 -eq 0 -or $done -eq $jobs.Count) {
-            Write-Log ("Progress: {0}/{1} DCs collected." -f $done, $jobs.Count) -Level INFO
+    $total = $DomainControllers.Count
+    $current = 0
+    
+    foreach ($dc in $DomainControllers) {
+        $current++
+        Write-Log "Processing DC $current of $total : $($dc.HostName)" -Level INFO
+        
+        try {
+            $result = Check-DCHealth -HostName $dc.HostName -Domain $dc.Domain -Site $dc.Site -IPv4 $dc.IPv4Address
+            $dcRows += $result
+        }
+        catch {
+            Write-Log "Failed to process DC $($dc.HostName): $($_.Exception.Message)" -Level WARN
+            # Add a placeholder for failed DC
+            $dcRows += [pscustomobject]@{
+                Domain      = $dc.Domain
+                HostName    = $dc.HostName
+                Site        = $dc.Site
+                IPv4Address = $dc.IPv4Address
+                Reachable   = $false
+                NTDS        = 'Unknown'
+                Netlogon    = 'Unknown'
+                KDC         = 'Unknown'
+                DFSR        = 'Unknown'
+                DNS         = 'Unknown'
+                DcStatus    = 'Red'
+            }
         }
     }
     
-    $pool.Close()
-    $pool.Dispose()
-    
-    Write-Log ("Parallel collection complete. {0} results." -f $dcRows.Count) -Level OK
+    Write-Log "Health collection complete. $($dcRows.Count) results." -Level OK
     return $dcRows
+}
+
+
+# =============================================================================
+# SECTION 3: EVENT LOG COLLECTION FUNCTIONS (Synchronous)
+# =============================================================================
+
+function Get-EventsFromDC {
+    param(
+        [string]$ComputerName,
+        [datetime]$StartTime
+    )
+    
+    $events = @()
+    
+    # Define event details
+    $eventDetails = @{
+        '4625' = @{ Name = 'Failed Logon'; Severity = 'Warning'; LogName = 'Security'; Description = 'Wrong password, expired account, or potential password-spraying attack' }
+        '4719' = @{ Name = 'System Audit Policy Modified'; Severity = 'Critical'; LogName = 'Security'; Description = 'Security auditing settings were modified' }
+        '4672' = @{ Name = 'Special Privileges Assigned'; Severity = 'Warning'; LogName = 'Security'; Description = 'Admin privileges assigned to new logon' }
+        '4648' = @{ Name = 'Explicit Credential Logon'; Severity = 'Warning'; LogName = 'Security'; Description = 'Logon attempted using explicit credentials' }
+        '1100' = @{ Name = 'Event Log Service Shutdown'; Severity = 'Warning'; LogName = 'System'; Description = 'The event logging service has shut down' }
+        '6008' = @{ Name = 'Unexpected Shutdown'; Severity = 'Critical'; LogName = 'System'; Description = 'Previous system shutdown was unexpected' }
+        '1074' = @{ Name = 'Planned Restart/Shutdown'; Severity = 'Info'; LogName = 'System'; Description = 'Planned restart or shutdown initiated' }
+    }
+    
+    # Security events
+    $securityEventIds = @('4625', '4719', '4672', '4648')
+    foreach ($eventId in $securityEventIds) {
+        try {
+            $filterHash = @{
+                LogName = 'Security'
+                ID = $eventId
+                StartTime = $StartTime
+            }
+            $results = Get-WinEvent -ComputerName $ComputerName -FilterHashtable $filterHash -MaxEvents 50 -ErrorAction SilentlyContinue
+            foreach ($evt in $results) {
+                $details = $eventDetails[$eventId]
+                $events += [pscustomobject]@{
+                    SourceDC = $ComputerName
+                    TimeCreated = $evt.TimeCreated
+                    LogName = $details.LogName
+                    EventID = $evt.Id
+                    EventName = $details.Name
+                    Severity = $details.Severity
+                    Description = $details.Description
+                    Message = ($evt.Message -replace "`r`n", ' ' -replace "`n", ' ') | Select-Object -First 300
+                }
+            }
+        }
+        catch {
+            # Silently continue for permission issues
+        }
+    }
+    
+    # System events
+    $systemEventIds = @('1100', '6008', '1074')
+    foreach ($eventId in $systemEventIds) {
+        try {
+            $filterHash = @{
+                LogName = 'System'
+                ID = $eventId
+                StartTime = $StartTime
+            }
+            $results = Get-WinEvent -ComputerName $ComputerName -FilterHashtable $filterHash -MaxEvents 50 -ErrorAction SilentlyContinue
+            foreach ($evt in $results) {
+                $details = $eventDetails[$eventId]
+                $events += [pscustomobject]@{
+                    SourceDC = $ComputerName
+                    TimeCreated = $evt.TimeCreated
+                    LogName = $details.LogName
+                    EventID = $evt.Id
+                    EventName = $details.Name
+                    Severity = $details.Severity
+                    Description = $details.Description
+                    Message = ($evt.Message -replace "`r`n", ' ' -replace "`n", ' ') | Select-Object -First 300
+                }
+            }
+        }
+        catch {
+            # Silently continue for permission issues
+        }
+    }
+    
+    return $events
+}
+
+function Collect-AllEvents {
+    param(
+        [array]$DomainControllers,
+        [datetime]$StartTime
+    )
+    
+    $allEvents = @()
+    $securityCount = 0
+    $systemCount = 0
+    
+    Write-Log "Collecting event logs from $($DomainControllers.Count) domain controllers..." -Level OK
+    
+    $total = $DomainControllers.Count
+    $current = 0
+    
+    foreach ($dc in $DomainControllers) {
+        $current++
+        Write-Log "Processing events from DC $current of $total : $($dc.HostName)" -Level INFO
+        
+        try {
+            $events = Get-EventsFromDC -ComputerName $dc.HostName -StartTime $StartTime
+            foreach ($event in $events) {
+                $allEvents += $event
+                if ($event.LogName -eq 'Security') { $securityCount++ }
+                if ($event.LogName -eq 'System') { $systemCount++ }
+            }
+        }
+        catch {
+            Write-Log "Failed to collect events from $($dc.HostName): $($_.Exception.Message)" -Level WARN
+        }
+    }
+    
+    Write-Log "Event collection complete: Security=$securityCount, System=$systemCount, Total=$($allEvents.Count)" -Level OK
+    
+    return $allEvents
 }
 
 
@@ -382,73 +373,86 @@ function Collect-DCHealthParallel {
 # =============================================================================
 
 function Get-FSMORoleStatus {
-    <#
-    .SYNOPSIS
-        Gets FSMO role holders and their reachability status
-    #>
-    param(
-        $Domain,
-        $Forest
-    )
-    
-    $fsmoMap = [ordered]@{
-        'PDC Emulator'          = [string]$Domain.PDCEmulator
-        'RID Master'            = [string]$Domain.RIDMaster
-        'Infrastructure Master' = [string]$Domain.InfrastructureMaster
-        'Schema Master'         = [string]$Forest.SchemaMaster
-        'Domain Naming Master'  = [string]$Forest.DomainNamingMaster
-    }
+    param($Domain, $Forest)
     
     $fsmoRows = @()
-    foreach ($role in $fsmoMap.GetEnumerator()) {
-        $ok = Test-DCConnectivity -ComputerName $role.Value
-        $fsmoRows += [pscustomobject]@{ 
-            Role = $role.Key
-            Holder = $role.Value
-            Reachable = $ok
-            Status = if ($ok) { 'Healthy' } else { 'Unreachable' }
-        }
+    
+    # PDC Emulator
+    try {
+        $holder = $Domain.PDCEmulator
+        $ok = Test-DCConnectivity -ComputerName $holder
+        $fsmoRows += [pscustomobject]@{ Role = 'PDC Emulator'; Holder = $holder; Reachable = $ok }
+    }
+    catch {
+        $fsmoRows += [pscustomobject]@{ Role = 'PDC Emulator'; Holder = 'Unknown'; Reachable = $false }
+    }
+    
+    # RID Master
+    try {
+        $holder = $Domain.RIDMaster
+        $ok = Test-DCConnectivity -ComputerName $holder
+        $fsmoRows += [pscustomobject]@{ Role = 'RID Master'; Holder = $holder; Reachable = $ok }
+    }
+    catch {
+        $fsmoRows += [pscustomobject]@{ Role = 'RID Master'; Holder = 'Unknown'; Reachable = $false }
+    }
+    
+    # Infrastructure Master
+    try {
+        $holder = $Domain.InfrastructureMaster
+        $ok = Test-DCConnectivity -ComputerName $holder
+        $fsmoRows += [pscustomobject]@{ Role = 'Infrastructure Master'; Holder = $holder; Reachable = $ok }
+    }
+    catch {
+        $fsmoRows += [pscustomobject]@{ Role = 'Infrastructure Master'; Holder = 'Unknown'; Reachable = $false }
+    }
+    
+    # Schema Master
+    try {
+        $holder = $Forest.SchemaMaster
+        $ok = Test-DCConnectivity -ComputerName $holder
+        $fsmoRows += [pscustomobject]@{ Role = 'Schema Master'; Holder = $holder; Reachable = $ok }
+    }
+    catch {
+        $fsmoRows += [pscustomobject]@{ Role = 'Schema Master'; Holder = 'Unknown'; Reachable = $false }
+    }
+    
+    # Domain Naming Master
+    try {
+        $holder = $Forest.DomainNamingMaster
+        $ok = Test-DCConnectivity -ComputerName $holder
+        $fsmoRows += [pscustomobject]@{ Role = 'Domain Naming Master'; Holder = $holder; Reachable = $ok }
+    }
+    catch {
+        $fsmoRows += [pscustomobject]@{ Role = 'Domain Naming Master'; Holder = 'Unknown'; Reachable = $false }
     }
     
     return $fsmoRows
 }
 
 function Get-ReplicationFailures {
-    <#
-    .SYNOPSIS
-        Gets replication failures for the forest
-    #>
-    param()
-    
     $replFailureRows = @()
     try {
         $replFailures = @(Get-ADReplicationFailure -Scope Forest -ErrorAction Stop)
         foreach ($f in $replFailures) {
             $replFailureRows += [pscustomobject]@{
-                Server           = [string]$f.Server
-                Partner          = [string]$f.Partner
-                LastError        = [string]$f.LastError
-                FailureCount     = [int]$f.FailureCount
+                Server = [string]$f.Server
+                Partner = [string]$f.Partner
+                LastError = [string]$f.LastError
+                FailureCount = [int]$f.FailureCount
                 FirstFailureTime = $f.FirstFailureTime
-                LastFailureTime  = $f.LastFailureTime
+                LastFailureTime = $f.LastFailureTime
             }
         }
     }
     catch {
-        $errorMsg = $_.Exception.Message
-        Write-Log "Get-ADReplicationFailure failed: $errorMsg" -Level WARN
+        Write-Log "Get-ADReplicationFailure failed: $($_.Exception.Message)" -Level WARN
     }
     
     return $replFailureRows
 }
 
 function Get-ReplicationSummaryText {
-    <#
-    .SYNOPSIS
-        Gets repadmin replication summary output
-    #>
-    param()
-    
     $replText = ''
     if ($IncludeReplicationText -and (Get-Command repadmin.exe -ErrorAction SilentlyContinue)) {
         try {
@@ -458,12 +462,11 @@ function Get-ReplicationSummaryText {
             }
         }
         catch {
-            $errorMsg = $_.Exception.Message
-            $replText = "repadmin failed: $errorMsg"
+            $replText = "repadmin failed: $($_.Exception.Message)"
         }
     }
     elseif (-not $IncludeReplicationText) {
-        $replText = 'Replication summary skipped (IncludeReplicationText=$false)'
+        $replText = 'Replication summary skipped'
     }
     else {
         $replText = 'repadmin.exe not found in PATH'
@@ -473,28 +476,29 @@ function Get-ReplicationSummaryText {
 }
 
 function Get-SiteStatistics {
-    <#
-    .SYNOPSIS
-        Calculates per-site statistics from DC health data
-    #>
     param([array]$DcRows)
     
-    $siteStats = @($DcRows | Group-Object -Property Site | ForEach-Object {
-        $sg = @($_.Group)
+    $siteStats = @()
+    $siteGroups = $DcRows | Group-Object -Property Site
+    
+    foreach ($group in $siteGroups) {
+        $sg = @($group.Group)
         $sRed = @($sg | Where-Object { $_.DcStatus -eq 'Red' }).Count
         $sYel = @($sg | Where-Object { $_.DcStatus -eq 'Yellow' }).Count
         $sGrn = @($sg | Where-Object { $_.DcStatus -eq 'Green' }).Count
         $sColor = if ($sRed -gt 0) { 'red' } elseif ($sYel -gt 0) { 'yellow' } else { 'green' }
-        [pscustomobject]@{
-            Site   = [string]$_.Name
-            Total  = $sg.Count
-            Red    = $sRed
+        
+        $siteStats += [pscustomobject]@{
+            Site = [string]$group.Name
+            Total = $sg.Count
+            Red = $sRed
             Yellow = $sYel
-            Green  = $sGrn
-            Color  = $sColor
+            Green = $sGrn
+            Color = $sColor
         }
-    } | Sort-Object Color, Site)
+    }
     
+    $siteStats = $siteStats | Sort-Object Color, Site
     return $siteStats
 }
 
@@ -504,33 +508,26 @@ function Get-SiteStatistics {
 # =============================================================================
 
 function Build-SiteCardsHtml {
-    <#
-    .SYNOPSIS
-        Builds HTML for site overview cards
-    #>
     param([array]$SiteStats)
     
-    $html = @($SiteStats | ForEach-Object {
-        $statusLine = if ($_.Red -gt 0) { "$($_.Red) unreachable" }
-                      elseif ($_.Yellow -gt 0) { "$($_.Yellow) service issue" }
+    $html = @()
+    foreach ($stat in $SiteStats) {
+        $statusLine = if ($stat.Red -gt 0) { "$($stat.Red) unreachable" }
+                      elseif ($stat.Yellow -gt 0) { "$($stat.Yellow) service issue" }
                       else { 'All healthy' }
-        $dcText = if ($_.Total -eq 1) { '1 DC' } else { "$($_.Total) DCs" }
+        $dcText = if ($stat.Total -eq 1) { '1 DC' } else { "$($stat.Total) DCs" }
         
-        "<div class='site-card site-$($_.Color)'>" +
-        "<div class='site-name'>$(HtmlSafe $_.Site)</div>" +
-        "<div class='site-count'>$dcText</div>" +
-        "<div class='site-status'>$statusLine</div>" +
-        "</div>"
-    }) -join [Environment]::NewLine
+        $html += "<div class='site-card site-$($stat.Color)'>" +
+                 "<div class='site-name'>$(HtmlSafe $stat.Site)</div>" +
+                 "<div class='site-count'>$dcText</div>" +
+                 "<div class='site-status'>$statusLine</div>" +
+                 "</div>"
+    }
     
-    return $html
+    return ($html -join [Environment]::NewLine)
 }
 
 function Build-PriorityIssuesHtml {
-    <#
-    .SYNOPSIS
-        Builds HTML table for priority issues
-    #>
     param([array]$DcRows)
     
     $issueRows = @($DcRows | Where-Object { $_.DcStatus -ne 'Green' })
@@ -539,81 +536,75 @@ function Build-PriorityIssuesHtml {
         return "<tr><td colspan='9' style='text-align:center'>No issues detected in this run</td></tr>"
     }
     
-    $html = @($issueRows | Sort-Object DcStatus, Site, HostName | ForEach-Object {
-        $rc = if ($_.DcStatus -eq 'Red') { 'row-red' } else { 'row-yellow' }
-        "<tr class='$rc'>" +
-        "<td>$(HtmlSafe $_.Site)</td>" +
-        "<td>$(HtmlSafe $_.HostName)</td>" +
-        "<td>$(HtmlSafe $_.IPv4Address)</td>" +
-        "<td>$(HtmlSafe $_.Reachable)</td>" +
-        "<td>$(Get-SvcBadge $_.NTDS)</td>" +
-        "<td>$(Get-SvcBadge $_.Netlogon)</td>" +
-        "<td>$(Get-SvcBadge $_.KDC)</td>" +
-        "<td>$(Get-SvcBadge $_.DFSR)</td>" +
-        "<td>$(Get-SvcBadge $_.DNS)</td>" +
-        "</tr>"
-    }) -join [Environment]::NewLine
+    $html = @()
+    foreach ($dc in ($issueRows | Sort-Object DcStatus, Site, HostName)) {
+        $rc = if ($dc.DcStatus -eq 'Red') { 'row-red' } else { 'row-yellow' }
+        $html += "<tr class='$rc'>" +
+                 "<td>$(HtmlSafe $dc.Site)</td>" +
+                 "<td>$(HtmlSafe $dc.HostName)</td>" +
+                 "<td>$(HtmlSafe $dc.IPv4Address)</td>" +
+                 "<td>$(HtmlSafe $dc.Reachable)</td>" +
+                 "<td>$(Get-SvcBadge $dc.NTDS)</td>" +
+                 "<td>$(Get-SvcBadge $dc.Netlogon)</td>" +
+                 "<td>$(Get-SvcBadge $dc.KDC)</td>" +
+                 "<td>$(Get-SvcBadge $dc.DFSR)</td>" +
+                 "<td>$(Get-SvcBadge $dc.DNS)</td>" +
+                 "</tr>"
+    }
     
-    return $html
+    return ($html -join [Environment]::NewLine)
 }
 
 function Build-FSMOHtml {
-    <#
-    .SYNOPSIS
-        Builds HTML table for FSMO role holders
-    #>
     param([array]$FsmoRows)
     
-    $html = @($FsmoRows | ForEach-Object {
-        $rc = if (-not $_.Reachable) { 'row-red' } else { '' }
-        $icon = if ($_.Reachable) { "<span class='svc svc-ok'>Reachable</span>" } 
+    $html = @()
+    foreach ($fsmo in $FsmoRows) {
+        $rc = if (-not $fsmo.Reachable) { 'row-red' } else { '' }
+        $icon = if ($fsmo.Reachable) { "<span class='svc svc-ok'>Reachable</span>" } 
                 else { "<span class='svc svc-bad'>UNREACHABLE</span>" }
-        "<tr class='$rc'>" +
-        "<td>$(HtmlSafe $_.Role)</td>" +
-        "<td>$(HtmlSafe $_.Holder)</td>" +
-        "<td>$icon</td>" +
-        "</tr>"
-    }) -join [Environment]::NewLine
+        $html += "<tr class='$rc'>" +
+                 "<td>$(HtmlSafe $fsmo.Role)</td>" +
+                 "<td>$(HtmlSafe $fsmo.Holder)</td>" +
+                 "<td>$icon</td>" +
+                 "</tr>"
+    }
     
-    return $html
+    return ($html -join [Environment]::NewLine)
 }
 
 function Build-ReplicationFailHtml {
-    <#
-    .SYNOPSIS
-        Builds HTML table for replication failures
-    #>
     param([array]$ReplFailureRows)
     
     if ($ReplFailureRows.Count -eq 0) {
         return "<tr><td colspan='6'>No replication failures detected across the forest.</td></tr>"
     }
     
-    $html = @($ReplFailureRows | Sort-Object FailureCount -Descending | ForEach-Object {
-        "<tr class='row-yellow'>" +
-        "<td>$(HtmlSafe $_.Server)</td>" +
-        "<td>$(HtmlSafe $_.Partner)</td>" +
-        "<td>$(HtmlSafe $_.LastError)</td>" +
-        "<td>$(HtmlSafe $_.FailureCount)</td>" +
-        "<td>$(HtmlSafe $_.FirstFailureTime)</td>" +
-        "<td>$(HtmlSafe $_.LastFailureTime)</td>" +
-        "</tr>"
-    }) -join [Environment]::NewLine
+    $html = @()
+    foreach ($r in ($ReplFailureRows | Sort-Object FailureCount -Descending)) {
+        $html += "<tr class='row-yellow'>" +
+                 "<td>$(HtmlSafe $r.Server)</td>" +
+                 "<td>$(HtmlSafe $r.Partner)</td>" +
+                 "<td>$(HtmlSafe $r.LastError)</td>" +
+                 "<td>$(HtmlSafe $r.FailureCount)</td>" +
+                 "<td>$(HtmlSafe $r.FirstFailureTime)</td>" +
+                 "<td>$(HtmlSafe $r.LastFailureTime)</td>" +
+                 "</tr>"
+    }
     
-    return $html
+    return ($html -join [Environment]::NewLine)
 }
 
 function Build-DCSiteSectionsHtml {
-    <#
-    .SYNOPSIS
-        Builds collapsible HTML sections for DCs grouped by site
-    #>
     param([array]$DcRows)
     
-    $html = @($DcRows | Group-Object -Property Site | Sort-Object Name | ForEach-Object {
-        $siteName = [string]$_.Name
+    $html = @()
+    $siteGroups = $DcRows | Group-Object -Property Site | Sort-Object Name
+    
+    foreach ($group in $siteGroups) {
+        $siteName = [string]$group.Name
         $safeId = $siteName -replace '[^a-zA-Z0-9]', '_'
-        $siteDcs = @($_.Group | Sort-Object DcStatus, HostName)
+        $siteDcs = @($group.Group | Sort-Object DcStatus, HostName)
         $sRed = @($siteDcs | Where-Object { $_.DcStatus -eq 'Red' }).Count
         $sYel = @($siteDcs | Where-Object { $_.DcStatus -eq 'Yellow' }).Count
         $badgeColor = if ($sRed -gt 0) { 'red' } elseif ($sYel -gt 0) { 'yellow' } else { 'green' }
@@ -622,27 +613,28 @@ function Build-DCSiteSectionsHtml {
                       else { 'Green' }
         $dcCountText = if ($siteDcs.Count -eq 1) { '1 DC' } else { "$($siteDcs.Count) DCs" }
         
-        $rows = @($siteDcs | ForEach-Object {
-            $rc = switch ($_.DcStatus) { 
+        $rows = @()
+        foreach ($dc in $siteDcs) {
+            $rc = switch ($dc.DcStatus) { 
                 'Red' { 'dc-row row-red' } 
                 'Yellow' { 'dc-row row-yellow' } 
                 default { 'dc-row' } 
             }
-            $reachIcon = if ($_.Reachable) { "<span class='svc svc-ok'>✓</span>" } 
+            $reachIcon = if ($dc.Reachable) { "<span class='svc svc-ok'>✓</span>" } 
                          else { "<span class='svc svc-bad'>✗</span>" }
-            $search = ($_.HostName + ' ' + $_.IPv4Address + ' ' + $_.Site).ToLower()
+            $search = ($dc.HostName + ' ' + $dc.IPv4Address + ' ' + $dc.Site).ToLower()
             
-            "<tr class='$rc' data-search='$(HtmlSafe $search)'>" +
-            "<td>$(HtmlSafe $_.HostName)</td>" +
-            "<td>$(HtmlSafe $_.IPv4Address)</td>" +
-            "<td>$reachIcon</td>" +
-            "<td>$(Get-SvcBadge $_.NTDS)</td>" +
-            "<td>$(Get-SvcBadge $_.Netlogon)</td>" +
-            "<td>$(Get-SvcBadge $_.KDC)</td>" +
-            "<td>$(Get-SvcBadge $_.DFSR)</td>" +
-            "<td>$(Get-SvcBadge $_.DNS)</td>" +
-            "</tr>"
-        }) -join [Environment]::NewLine
+            $rows += "<tr class='$rc' data-search='$(HtmlSafe $search)'>" +
+                     "<td>$(HtmlSafe $dc.HostName)</td>" +
+                     "<td>$(HtmlSafe $dc.IPv4Address)</td>" +
+                     "<td>$reachIcon</td>" +
+                     "<td>$(Get-SvcBadge $dc.NTDS)</td>" +
+                     "<td>$(Get-SvcBadge $dc.Netlogon)</td>" +
+                     "<td>$(Get-SvcBadge $dc.KDC)</td>" +
+                     "<td>$(Get-SvcBadge $dc.DFSR)</td>" +
+                     "<td>$(Get-SvcBadge $dc.DNS)</td>" +
+                     "</tr>"
+        }
         
         $block = "<div class='site-section'>"
         $block += "<div class='site-header' onclick='toggleSite(`"$safeId`")'>"
@@ -654,28 +646,23 @@ function Build-DCSiteSectionsHtml {
         $block += "<table><thead>"
         $block += "<tr><th>Domain Controller</th><th>IP Address</th><th>Reachable</th>"
         $block += "<th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></tr>"
-        $block += "</thead><tbody>$rows</tbody></table></div></div>"
+        $block += "</thead><tbody>" + ($rows -join [Environment]::NewLine) + "</tbody>"
+        $block += "</div></div>"
         
-        $block
-    }) -join [Environment]::NewLine
+        $html += $block
+    }
     
-    return $html
+    return ($html -join [Environment]::NewLine)
 }
 
 function Build-EventsHtml {
-    <#
-    .SYNOPSIS
-        Builds HTML table for collected events
-    #>
     param([array]$Events)
     
     if ($Events.Count -eq 0) {
         return "<div class='no-events'>No events detected in the last $EventLookbackHours hour(s).</div>"
     }
     
-    # Define severity order for sorting
     $severityOrder = @{ 'Critical' = 1; 'Warning' = 2; 'Info' = 3 }
-    
     $sortedEvents = $Events | Sort-Object { $severityOrder[[string]$_.Severity] }, TimeCreated -Descending
     
     $html = "<thead>"
@@ -695,6 +682,11 @@ function Build-EventsHtml {
             default    { 'event-info' }
         }
         
+        $shortMessage = $event.Message
+        if ($shortMessage.Length -gt 200) {
+            $shortMessage = $shortMessage.Substring(0, 200) + "..."
+        }
+        
         $html += "<tr class='$severityClass'>"
         $html += "<td>$($event.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))</td>"
         $html += "<td>$(HtmlSafe $event.SourceDC)</td>"
@@ -702,11 +694,6 @@ function Build-EventsHtml {
         $html += "<td>$(HtmlSafe $event.EventName)</td>"
         $html += "<td><span class='event-badge $severityClass'>$(HtmlSafe $event.Severity)</span></td>"
         $html += "<td><div class='event-message'>$(HtmlSafe $event.Description)</div></td>"
-        
-        $shortMessage = $event.Message
-        if ($shortMessage.Length -gt 200) {
-            $shortMessage = $shortMessage.Substring(0, 200) + "..."
-        }
         $html += "<td><div class='event-message'>$(HtmlSafe $shortMessage)</div></td>"
         $html += "</tr>"
         $count++
@@ -717,10 +704,6 @@ function Build-EventsHtml {
 }
 
 function Build-EventStatsCards {
-    <#
-    .SYNOPSIS
-        Builds summary cards for event statistics
-    #>
     param([array]$Events)
     
     $criticalCount = @($Events | Where-Object { $_.Severity -eq 'Critical' }).Count
@@ -729,7 +712,6 @@ function Build-EventStatsCards {
     
     $totalEvents = $Events.Count
     
-    # Count specific event types
     $failedLogonCount = @($Events | Where-Object { $_.EventID -eq '4625' }).Count
     $auditChangeCount = @($Events | Where-Object { $_.EventID -eq '4719' }).Count
     $adminLoginCount = @($Events | Where-Object { $_.EventID -eq '4672' }).Count
@@ -743,7 +725,6 @@ function Build-EventStatsCards {
     $html += "<div class='card event-info'><div class='k'>Informational</div><div class='v'>$infoCount</div></div>"
     $html += "</div>"
     
-    # Add detailed event type statistics
     $html += "<div class='cards' style='margin-top: 10px;'>"
     $html += "<div class='card'><div class='k'>Failed Logons (4625)</div><div class='v'>$failedLogonCount</div><div class='detail'>Password spraying indicator</div></div>"
     $html += "<div class='card'><div class='k'>Audit Changes (4719)</div><div class='v'>$auditChangeCount</div><div class='detail'>Security settings modified</div></div>"
@@ -760,101 +741,114 @@ function Build-EventStatsCards {
 # SECTION 6: MAIN EXECUTION
 # =============================================================================
 
-# Display runbook if requested
-if ($Runbook) {
-    Write-HealthRunbook
-    return
-}
-
-# Create output directory
-if (-not (Test-Path -LiteralPath $OutputDirectory)) {
-    New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-}
-
-Write-Log "═══════════════════════════════════════════════════════════════════════════════" -Level OK
-Write-Log "              AD Daily Health Summary - Starting Collection" -Level OK
-Write-Log "═══════════════════════════════════════════════════════════════════════════════" -Level OK
-
-# Load Active Directory module
-Write-Log "Loading ActiveDirectory module..." -Level INFO
-Import-Module ActiveDirectory -ErrorAction Stop
-
-# Get AD structure
-$domain = Get-ADDomain
-$forest = Get-ADForest
-$allDcs = @(Get-ADDomainController -Filter *)
-
-# Apply demo mode limit
-if ($DemoMode -and $allDcs.Count -gt $DemoDomainControllerLimit) {
-    $allDcs = @($allDcs | Sort-Object HostName | Select-Object -First $DemoDomainControllerLimit)
-    Write-Log "Demo mode: limited to first $DemoDomainControllerLimit domain controllers." -Level WARN
-}
-
-Write-Log "Domain: $($domain.DNSRoot)" -Level INFO
-Write-Log "Forest: $($forest.Name)" -Level INFO
-Write-Log "Total Domain Controllers: $($allDcs.Count)" -Level INFO
-
-# Collect DC health
-$dcRows = Collect-DCHealthParallel -DomainControllers $allDcs -MaxConcurrency $MaxConcurrency
-
-# Collect FSMO and replication data
-$fsmoRows = Get-FSMORoleStatus -Domain $domain -Forest $forest
-$replFailureRows = Get-ReplicationFailures
-$replText = Get-ReplicationSummaryText
-$siteStats = Get-SiteStatistics -DcRows $dcRows
-
-# Collect events (if not skipped)
-$allEvents = @()
-if (-not $SkipEventLogs) {
-    $startTime = (Get-Date).AddHours(-$EventLookbackHours)
-    Write-Log "Collecting events from last $EventLookbackHours hour(s)..." -Level INFO
-    Write-Log "Monitoring Event IDs: 4625 (Failed Logon), 4719 (Audit Change), 4672 (Admin Login), 4648 (Explicit Cred), 1100 (Log Shutdown), 6008 (Unexpected Shutdown), 1074 (Planned Shutdown)" -Level INFO
-    $allEvents = Collect-AllEvents -DomainControllers $allDcs -StartTime $startTime -MaxConcurrency $MaxConcurrency
-} else {
-    Write-Log "Event collection skipped (SkipEventLogs = true)" -Level WARN
-}
-
-# Calculate health status
-$reachableCount = @($dcRows | Where-Object { $_.Reachable }).Count
-$unreachableCount = @($dcRows | Where-Object { -not $_.Reachable }).Count
-$issueRows = @($dcRows | Where-Object { $_.DcStatus -ne 'Green' })
-$fsmoDown = @($fsmoRows | Where-Object { -not $_.Reachable }).Count
-$replIssueCount = $replFailureRows.Count
-
-$healthStatus = if ($unreachableCount -gt 0 -or $fsmoDown -gt 0) { 'Red' }
-                elseif ($issueRows.Count -gt 0 -or $replIssueCount -gt 0) { 'Yellow' }
-                else { 'Green' }
-
-$escalationGuidance = switch ($healthStatus) {
-    'Red'    { '⚠️ IMMEDIATE ACTION: One or more domain controllers or FSMO role holders are unreachable. Investigate immediately.' }
-    'Yellow' { '⚠️ ATTENTION: Service degradation or replication failures detected. Review the issues below.' }
-    default  { '✅ All domain controllers and FSMO role holders are healthy. Continue daily monitoring.' }
-}
-
-# Build HTML fragments
-$siteCardsHtml = Build-SiteCardsHtml -SiteStats $siteStats
-$priorityHtml = Build-PriorityIssuesHtml -DcRows $dcRows
-$fsmoHtml = Build-FSMOHtml -FsmoRows $fsmoRows
-$replFailHtml = Build-ReplicationFailHtml -ReplFailureRows $replFailureRows
-$siteGroupHtml = Build-DCSiteSectionsHtml -DcRows $dcRows
-$eventStatsHtml = Build-EventStatsCards -Events $allEvents
-$eventsHtml = Build-EventsHtml -Events $allEvents
-
-# Generate output paths
-$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$htmlPath = Join-Path $OutputDirectory "AD_Daily_Health_Summary_$stamp.html"
-$dcCsv = Join-Path $OutputDirectory "AD_Daily_Health_DCs_$stamp.csv"
-$eventCsv = Join-Path $OutputDirectory "AD_Daily_Health_Events_$stamp.csv"
-$jsonPath = Join-Path $OutputDirectory "AD_Daily_Health_Summary_$stamp.json"
-
-# Export CSV files
-$dcRows | Export-Csv -Path $dcCsv -NoTypeInformation -Encoding UTF8
-$allEvents | Export-Csv -Path $eventCsv -NoTypeInformation -Encoding UTF8
-Write-Log "Exported DC CSV: $dcCsv" -Level OK
-Write-Log "Exported Events CSV: $eventCsv" -Level OK
-
-# Generate HTML content
-$htmlContent = @"
+try {
+    # Display runbook if requested
+    if ($Runbook) {
+        Write-HealthRunbook
+        return
+    }
+    
+    # Create output directory
+    if (-not (Test-Path -LiteralPath $OutputDirectory)) {
+        New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+        Write-Log "Created output directory: $OutputDirectory" -Level OK
+    }
+    
+    Write-Log "═══════════════════════════════════════════════════════════════════════════════" -Level OK
+    Write-Log "              AD Daily Health Summary - Starting Collection" -Level OK
+    Write-Log "═══════════════════════════════════════════════════════════════════════════════" -Level OK
+    
+    # Load Active Directory module
+    Write-Log "Loading ActiveDirectory module..." -Level INFO
+    Import-Module ActiveDirectory -ErrorAction Stop
+    Write-Log "ActiveDirectory module loaded successfully." -Level OK
+    
+    # Get AD structure
+    Write-Log "Getting AD forest and domain information..." -Level INFO
+    $domain = Get-ADDomain
+    $forest = Get-ADForest
+    $allDcs = @(Get-ADDomainController -Filter *)
+    
+    Write-Log "Domain: $($domain.DNSRoot)" -Level INFO
+    Write-Log "Forest: $($forest.Name)" -Level INFO
+    Write-Log "Total Domain Controllers: $($allDcs.Count)" -Level INFO
+    
+    # Apply demo mode limit
+    if ($DemoMode -and $allDcs.Count -gt $DemoDomainControllerLimit) {
+        $allDcs = @($allDcs | Sort-Object HostName | Select-Object -First $DemoDomainControllerLimit)
+        Write-Log "Demo mode: limited to first $DemoDomainControllerLimit domain controllers." -Level WARN
+    }
+    
+    # Collect DC health
+    $dcRows = Collect-DCHealth -DomainControllers $allDcs
+    
+    # Collect FSMO and replication data
+    Write-Log "Collecting FSMO role status..." -Level INFO
+    $fsmoRows = Get-FSMORoleStatus -Domain $domain -Forest $forest
+    
+    Write-Log "Collecting replication failures..." -Level INFO
+    $replFailureRows = Get-ReplicationFailures
+    
+    Write-Log "Getting replication summary..." -Level INFO
+    $replText = Get-ReplicationSummaryText
+    
+    Write-Log "Calculating site statistics..." -Level INFO
+    $siteStats = Get-SiteStatistics -DcRows $dcRows
+    
+    # Collect events (if not skipped)
+    $allEvents = @()
+    if (-not $SkipEventLogs) {
+        $startTime = (Get-Date).AddHours(-$EventLookbackHours)
+        Write-Log "Collecting events from last $EventLookbackHours hour(s)..." -Level INFO
+        Write-Log "Monitoring Event IDs: 4625, 4719, 4672, 4648, 1100, 6008, 1074" -Level INFO
+        $allEvents = Collect-AllEvents -DomainControllers $allDcs -StartTime $startTime
+    } else {
+        Write-Log "Event collection skipped (SkipEventLogs = true)" -Level WARN
+    }
+    
+    # Calculate health status
+    $reachableCount = @($dcRows | Where-Object { $_.Reachable }).Count
+    $unreachableCount = @($dcRows | Where-Object { -not $_.Reachable }).Count
+    $issueRows = @($dcRows | Where-Object { $_.DcStatus -ne 'Green' })
+    $fsmoDown = @($fsmoRows | Where-Object { -not $_.Reachable }).Count
+    $replIssueCount = $replFailureRows.Count
+    
+    $healthStatus = if ($unreachableCount -gt 0 -or $fsmoDown -gt 0) { 'Red' }
+                    elseif ($issueRows.Count -gt 0 -or $replIssueCount -gt 0) { 'Yellow' }
+                    else { 'Green' }
+    
+    $escalationGuidance = switch ($healthStatus) {
+        'Red'    { '⚠️ IMMEDIATE ACTION: One or more domain controllers or FSMO role holders are unreachable. Investigate immediately.' }
+        'Yellow' { '⚠️ ATTENTION: Service degradation or replication failures detected. Review the issues below.' }
+        default  { '✅ All domain controllers and FSMO role holders are healthy. Continue daily monitoring.' }
+    }
+    
+    # Build HTML fragments
+    Write-Log "Building HTML report..." -Level INFO
+    $siteCardsHtml = Build-SiteCardsHtml -SiteStats $siteStats
+    $priorityHtml = Build-PriorityIssuesHtml -DcRows $dcRows
+    $fsmoHtml = Build-FSMOHtml -FsmoRows $fsmoRows
+    $replFailHtml = Build-ReplicationFailHtml -ReplFailureRows $replFailureRows
+    $siteGroupHtml = Build-DCSiteSectionsHtml -DcRows $dcRows
+    $eventStatsHtml = Build-EventStatsCards -Events $allEvents
+    $eventsHtml = Build-EventsHtml -Events $allEvents
+    
+    # Generate output paths
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $htmlPath = Join-Path $OutputDirectory "AD_Daily_Health_Summary_$stamp.html"
+    $dcCsv = Join-Path $OutputDirectory "AD_Daily_Health_DCs_$stamp.csv"
+    $eventCsv = Join-Path $OutputDirectory "AD_Daily_Health_Events_$stamp.csv"
+    $jsonPath = Join-Path $OutputDirectory "AD_Daily_Health_Summary_$stamp.json"
+    
+    # Export CSV files
+    Write-Log "Exporting CSV files..." -Level INFO
+    $dcRows | Export-Csv -Path $dcCsv -NoTypeInformation -Encoding UTF8
+    $allEvents | Export-Csv -Path $eventCsv -NoTypeInformation -Encoding UTF8
+    Write-Log "Exported DC CSV: $dcCsv" -Level OK
+    Write-Log "Exported Events CSV: $eventCsv" -Level OK
+    
+    # Generate HTML content
+    $htmlContent = @"
 <!DOCTYPE html>
 <html lang='en'>
 <head>
@@ -1109,61 +1103,72 @@ function filterDCs(val) {
 </html>
 "@
 
-# Save HTML file
-[System.IO.File]::WriteAllText($htmlPath, $htmlContent, [System.Text.Encoding]::UTF8)
-
-# Save JSON payload
-$jsonPayload = [pscustomobject]@{
-    GeneratedOn = (Get-Date).ToString('s')
-    Domain = [string]$domain.DNSRoot
-    Forest = [string]$forest.Name
-    HealthStatus = $healthStatus
-    EscalationGuidance = $escalationGuidance
-    EventLookbackHours = $EventLookbackHours
-    DomainControllerCount = $dcRows.Count
-    SiteCount = $siteStats.Count
-    ReachableCount = $reachableCount
-    UnreachableCount = $unreachableCount
-    ServiceIssueCount = $issueRows.Count
-    ReplicationFailures = $replIssueCount
-    FsmoIssues = $fsmoDown
-    EventStats = @{
-        TotalEvents = $allEvents.Count
-        CriticalEvents = @($allEvents | Where-Object { $_.Severity -eq 'Critical' }).Count
-        WarningEvents = @($allEvents | Where-Object { $_.Severity -eq 'Warning' }).Count
-        InfoEvents = @($allEvents | Where-Object { $_.Severity -eq 'Info' }).Count
-        FailedLogonCount = @($allEvents | Where-Object { $_.EventID -eq '4625' }).Count
-        AuditChangeCount = @($allEvents | Where-Object { $_.EventID -eq '4719' }).Count
-        AdminLoginCount = @($allEvents | Where-Object { $_.EventID -eq '4672' }).Count
-        ExplicitCredCount = @($allEvents | Where-Object { $_.EventID -eq '4648' }).Count
-        UnexpectedShutdownCount = @($allEvents | Where-Object { $_.EventID -eq '6008' }).Count
+    # Save HTML file
+    [System.IO.File]::WriteAllText($htmlPath, $htmlContent, [System.Text.Encoding]::UTF8)
+    
+    # Save JSON payload
+    $jsonPayload = [pscustomobject]@{
+        GeneratedOn = (Get-Date).ToString('s')
+        Domain = [string]$domain.DNSRoot
+        Forest = [string]$forest.Name
+        HealthStatus = $healthStatus
+        EscalationGuidance = $escalationGuidance
+        EventLookbackHours = $EventLookbackHours
+        DomainControllerCount = $dcRows.Count
+        SiteCount = $siteStats.Count
+        ReachableCount = $reachableCount
+        UnreachableCount = $unreachableCount
+        ServiceIssueCount = $issueRows.Count
+        ReplicationFailures = $replIssueCount
+        FsmoIssues = $fsmoDown
+        EventStats = @{
+            TotalEvents = $allEvents.Count
+            CriticalEvents = @($allEvents | Where-Object { $_.Severity -eq 'Critical' }).Count
+            WarningEvents = @($allEvents | Where-Object { $_.Severity -eq 'Warning' }).Count
+            InfoEvents = @($allEvents | Where-Object { $_.Severity -eq 'Info' }).Count
+            FailedLogonCount = @($allEvents | Where-Object { $_.EventID -eq '4625' }).Count
+            AuditChangeCount = @($allEvents | Where-Object { $_.EventID -eq '4719' }).Count
+            AdminLoginCount = @($allEvents | Where-Object { $_.EventID -eq '4672' }).Count
+            ExplicitCredCount = @($allEvents | Where-Object { $_.EventID -eq '4648' }).Count
+            UnexpectedShutdownCount = @($allEvents | Where-Object { $_.EventID -eq '6008' }).Count
+        }
+        SiteStats = @($siteStats)
+        DomainControllers = @($dcRows | Select-Object Domain, HostName, Site, Reachable, DcStatus)
+        FsmoRoles = @($fsmoRows)
+        ReplicationFailureRows = @($replFailureRows)
+        MonitoredEvents = @('4625', '4719', '4672', '4648', '1100', '6008', '1074')
     }
-    SiteStats = @($siteStats)
-    DomainControllers = @($dcRows | Select-Object Domain, HostName, Site, Reachable, DcStatus)
-    FsmoRoles = @($fsmoRows)
-    ReplicationFailureRows = @($replFailureRows)
-    MonitoredEvents = @('4625', '4719', '4672', '4648', '1100', '6008', '1074')
+    
+    $jsonPayload | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonPath -Encoding UTF8
+    
+    Write-Log "═══════════════════════════════════════════════════════════════════════════════" -Level OK
+    Write-Log "              AD Daily Health Summary Complete!" -Level OK
+    Write-Log "═══════════════════════════════════════════════════════════════════════════════" -Level OK
+    Write-Log "📄 HTML Report : $htmlPath" -Level OK
+    Write-Log "📊 DC CSV      : $dcCsv" -Level OK
+    Write-Log "📋 Events CSV  : $eventCsv" -Level OK
+    Write-Log "📦 JSON Report : $jsonPath" -Level OK
+    Write-Log "═══════════════════════════════════════════════════════════════════════════════" -Level OK
+    
+    # Return output object
+    [pscustomobject]@{
+        HtmlReport = $htmlPath
+        DcCsv = $dcCsv
+        EventCsv = $eventCsv
+        JsonReport = $jsonPath
+        OverallStatus = $healthStatus
+        EventCount = $allEvents.Count
+        CriticalEventCount = @($allEvents | Where-Object { $_.Severity -eq 'Critical' }).Count
+        FailedLogonCount = @($allEvents | Where-Object { $_.EventID -eq '4625' }).Count
+    }
 }
-
-$jsonPayload | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonPath -Encoding UTF8
-
-Write-Log "═══════════════════════════════════════════════════════════════════════════════" -Level OK
-Write-Log "              AD Daily Health Summary Complete!" -Level OK
-Write-Log "═══════════════════════════════════════════════════════════════════════════════" -Level OK
-Write-Log "📄 HTML Report : $htmlPath" -Level OK
-Write-Log "📊 DC CSV      : $dcCsv" -Level OK
-Write-Log "📋 Events CSV  : $eventCsv" -Level OK
-Write-Log "📦 JSON Report : $jsonPath" -Level OK
-Write-Log "═══════════════════════════════════════════════════════════════════════════════" -Level OK
-
-# Return output object
-[pscustomobject]@{
-    HtmlReport = $htmlPath
-    DcCsv = $dcCsv
-    EventCsv = $eventCsv
-    JsonReport = $jsonPath
-    OverallStatus = $healthStatus
-    EventCount = $allEvents.Count
-    CriticalEventCount = @($allEvents | Where-Object { $_.Severity -eq 'Critical' }).Count
-    FailedLogonCount = @($allEvents | Where-Object { $_.EventID -eq '4625' }).Count
+catch {
+    Write-Log "FATAL ERROR: $($_.Exception.Message)" -Level ERROR
+    Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level ERROR
+    
+    # Return error object instead of exiting
+    [pscustomobject]@{
+        Error = $_.Exception.Message
+        StackTrace = $_.ScriptStackTrace
+    }
 }
