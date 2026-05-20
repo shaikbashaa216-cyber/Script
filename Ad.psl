@@ -9,10 +9,19 @@
     
     Features:
     - Parallel DC health collection for large environments
-    - Security event monitoring (account lockouts, logon failures, privilege changes)
+    - Security event monitoring (failed logons, privilege changes, audit changes)
     - System health events (unexpected shutdowns, service issues)
     - HTML dashboard with site-based organization and search
     - CSV/JSON exports for further analysis
+    
+    Monitored Event IDs:
+    - 4625: Failed logon (wrong passwords, expired accounts, password-spraying)
+    - 4719: System audit policy modified
+    - 4672: Special privileges assigned to new logon (admin login)
+    - 4648: Logon attempted using explicit credentials
+    - 1100: Event logging service shut down
+    - 6008: Unexpected previous shutdown
+    - 1074: Planned restart/shutdown initiated
     
 .NOTES
     Run on a domain-joined server with ActiveDirectory module and admin privileges.
@@ -138,7 +147,8 @@ function Get-SvcBadge {
 function Collect-AllEvents {
     <#
     .SYNOPSIS
-        Collects all event types from domain controllers
+        Collects specified event types from domain controllers
+        Monitored Events: 4625, 4719, 4672, 4648, 1100, 6008, 1074
     #>
     param(
         [array]$DomainControllers,
@@ -150,52 +160,75 @@ function Collect-AllEvents {
     $eventStats = @{
         SecurityEvents = 0
         SystemEvents = 0
-        ADEvents = 0
     }
     
     Write-Log "Collecting event logs from $($DomainControllers.Count) domain controllers..." -Level OK
     
+    # Define event details
+    $eventDetails = @{
+        '4625' = @{ Name = 'Failed Logon'; Severity = 'Warning'; LogName = 'Security'; Description = 'Wrong password, expired account, or potential password-spraying attack' }
+        '4719' = @{ Name = 'System Audit Policy Modified'; Severity = 'Critical'; LogName = 'Security'; Description = 'Security auditing settings were modified' }
+        '4672' = @{ Name = 'Special Privileges Assigned'; Severity = 'Warning'; LogName = 'Security'; Description = 'Admin privileges assigned to new logon (e.g., Administrator login)' }
+        '4648' = @{ Name = 'Explicit Credential Logon'; Severity = 'Warning'; LogName = 'Security'; Description = 'Logon attempted using explicit credentials' }
+        '1100' = @{ Name = 'Event Log Service Shutdown'; Severity = 'Warning'; LogName = 'System'; Description = 'The event logging service has shut down' }
+        '6008' = @{ Name = 'Unexpected Shutdown'; Severity = 'Critical'; LogName = 'System'; Description = 'Previous system shutdown was unexpected' }
+        '1074' = @{ Name = 'Planned Restart/Shutdown'; Severity = 'Info'; LogName = 'System'; Description = 'Planned restart or shutdown initiated by application or user' }
+    }
+    
     $eventScript = {
-        param($ComputerName, $StartTime)
+        param($ComputerName, $StartTime, $EventDetails)
         
         $events = @()
         
-        # Security events
-        $securityEventIds = @('4740','4624','4625','4634','4647','4648','4720','4722','4725','4738',
-                              '4723','4724','4728','4732','4756','5136','5137','5138','5139','4719','4672','4767')
+        # Security events (4625, 4719, 4672, 4648)
+        $securityEventIds = @('4625', '4719', '4672', '4648')
         try {
             $securityEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
                 LogName = 'Security'
                 ID = $securityEventIds
                 StartTime = $StartTime
-            } -MaxEvents 150 -ErrorAction SilentlyContinue
-            $events += $securityEvents
+            } -MaxEvents 200 -ErrorAction SilentlyContinue
+            
+            foreach ($evt in $securityEvents) {
+                $evtId = [string]$evt.Id
+                $details = $EventDetails[$evtId]
+                $events += [pscustomobject]@{
+                    EventID = $evtId
+                    EventName = $details.Name
+                    Severity = $details.Severity
+                    LogName = 'Security'
+                    TimeCreated = $evt.TimeCreated
+                    Message = $evt.Message -replace "`r`n", ' ' -replace "`n", ' ' | Select-Object -First 300
+                    Description = $details.Description
+                }
+            }
         }
-        catch {}
+        catch { }
         
-        # System events
-        $systemEventIds = @('41','6008','1074','1100')
+        # System events (1100, 6008, 1074)
+        $systemEventIds = @('1100', '6008', '1074')
         try {
             $systemEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
                 LogName = 'System'
                 ID = $systemEventIds
                 StartTime = $StartTime
-            } -MaxEvents 50 -ErrorAction SilentlyContinue
-            $events += $systemEvents
+            } -MaxEvents 200 -ErrorAction SilentlyContinue
+            
+            foreach ($evt in $systemEvents) {
+                $evtId = [string]$evt.Id
+                $details = $EventDetails[$evtId]
+                $events += [pscustomobject]@{
+                    EventID = $evtId
+                    EventName = $details.Name
+                    Severity = $details.Severity
+                    LogName = 'System'
+                    TimeCreated = $evt.TimeCreated
+                    Message = $evt.Message -replace "`r`n", ' ' -replace "`n", ' ' | Select-Object -First 300
+                    Description = $details.Description
+                }
+            }
         }
-        catch {}
-        
-        # Directory Service events
-        $adEventIds = @('1000','1001','1126','1168','1925','1988','2042','4013')
-        try {
-            $adEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
-                LogName = 'Directory Service'
-                ID = $adEventIds
-                StartTime = $StartTime
-            } -MaxEvents 50 -ErrorAction SilentlyContinue
-            $events += $adEvents
-        }
-        catch {}
+        catch { }
         
         return $events
     }
@@ -210,31 +243,27 @@ function Collect-AllEvents {
         [void]$ps.AddScript($eventScript)
         [void]$ps.AddArgument($dc.HostName)
         [void]$ps.AddArgument($StartTime)
+        [void]$ps.AddArgument($eventDetails)
         $jobs += [pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke(); DCName = $dc.HostName }
     }
     
     foreach ($job in $jobs) {
         $result = $job.PS.EndInvoke($job.Handle)
         foreach ($event in $result) {
-            $eventLevel = $event.LevelDisplayName
-            if ([string]::IsNullOrEmpty($eventLevel)) {
-                $eventLevel = 'Info'
-            }
-            
             $allEvents += [pscustomobject]@{
                 SourceDC = $job.DCName
                 TimeCreated = $event.TimeCreated
                 LogName = $event.LogName
-                EventID = $event.Id
-                Level = $eventLevel
-                Message = $event.Message -replace "`r`n", ' ' -replace "`n", ' ' | Select-Object -First 300
-                ProviderName = $event.ProviderName
+                EventID = $event.EventID
+                EventName = $event.EventName
+                Severity = $event.Severity
+                Description = $event.Description
+                Message = $event.Message
             }
             
             # Update stats
             if ($event.LogName -eq 'Security') { $eventStats.SecurityEvents++ }
             elseif ($event.LogName -eq 'System') { $eventStats.SystemEvents++ }
-            elseif ($event.LogName -eq 'Directory Service') { $eventStats.ADEvents++ }
         }
         $job.PS.Dispose()
     }
@@ -242,7 +271,7 @@ function Collect-AllEvents {
     $pool.Close()
     $pool.Dispose()
     
-    Write-Log ("Event collection complete: Security={0}, System={1}, AD={2}" -f $eventStats.SecurityEvents, $eventStats.SystemEvents, $eventStats.ADEvents) -Level OK
+    Write-Log ("Event collection complete: Security={0}, System={1}" -f $eventStats.SecurityEvents, $eventStats.SystemEvents) -Level OK
     
     return $allEvents
 }
@@ -641,26 +670,26 @@ function Build-EventsHtml {
     param([array]$Events)
     
     if ($Events.Count -eq 0) {
-        return "<div class='no-events'>No critical events detected in the last $EventLookbackHours hour(s).</div>"
+        return "<div class='no-events'>No events detected in the last $EventLookbackHours hour(s).</div>"
     }
     
     # Define severity order for sorting
     $severityOrder = @{ 'Critical' = 1; 'Warning' = 2; 'Info' = 3 }
     
-    $sortedEvents = $Events | Sort-Object { $severityOrder[[string]$_.Level] }, TimeCreated -Descending
+    $sortedEvents = $Events | Sort-Object { $severityOrder[[string]$_.Severity] }, TimeCreated -Descending
     
     $html = "<thead>"
-    $html += "<tr><th>Time</th><th>Source DC</th><th>Event ID</th><th>Log</th><th>Severity</th><th>Message</th></tr>"
+    $html += "<tr><th>Time</th><th>Source DC</th><th>Event ID</th><th>Event Name</th><th>Severity</th><th>Description</th><th>Message</th></tr>"
     $html += "</thead><tbody>"
     
     $count = 0
     foreach ($event in $sortedEvents) {
         if ($count -ge 200) { 
-            $html += "<tr><td colspan='6' class='text-center'>... and $($Events.Count - 200) more events (see CSV export for full list)</td></tr>"
+            $html += "<tr><td colspan='7' class='text-center'>... and $($Events.Count - 200) more events (see CSV export for full list)</td></tr>"
             break 
         }
         
-        $severityClass = switch ($event.Level) {
+        $severityClass = switch ($event.Severity) {
             'Critical' { 'event-critical' }
             'Warning'  { 'event-warning' }
             default    { 'event-info' }
@@ -670,12 +699,13 @@ function Build-EventsHtml {
         $html += "<td>$($event.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))</td>"
         $html += "<td>$(HtmlSafe $event.SourceDC)</td>"
         $html += "<td>$($event.EventID)</td>"
-        $html += "<td>$(HtmlSafe $event.LogName)</td>"
-        $html += "<td><span class='event-badge $severityClass'>$(HtmlSafe $event.Level)</span></td>"
+        $html += "<td>$(HtmlSafe $event.EventName)</td>"
+        $html += "<td><span class='event-badge $severityClass'>$(HtmlSafe $event.Severity)</span></td>"
+        $html += "<td><div class='event-message'>$(HtmlSafe $event.Description)</div></td>"
         
         $shortMessage = $event.Message
-        if ($shortMessage.Length -gt 150) {
-            $shortMessage = $shortMessage.Substring(0, 150) + "..."
+        if ($shortMessage.Length -gt 200) {
+            $shortMessage = $shortMessage.Substring(0, 200) + "..."
         }
         $html += "<td><div class='event-message'>$(HtmlSafe $shortMessage)</div></td>"
         $html += "</tr>"
@@ -693,17 +723,33 @@ function Build-EventStatsCards {
     #>
     param([array]$Events)
     
-    $criticalCount = @($Events | Where-Object { $_.Level -eq 'Critical' }).Count
-    $warningCount = @($Events | Where-Object { $_.Level -eq 'Warning' }).Count
-    $infoCount = @($Events | Where-Object { $_.Level -eq 'Info' }).Count
+    $criticalCount = @($Events | Where-Object { $_.Severity -eq 'Critical' }).Count
+    $warningCount = @($Events | Where-Object { $_.Severity -eq 'Warning' }).Count
+    $infoCount = @($Events | Where-Object { $_.Severity -eq 'Info' }).Count
     
     $totalEvents = $Events.Count
+    
+    # Count specific event types
+    $failedLogonCount = @($Events | Where-Object { $_.EventID -eq '4625' }).Count
+    $auditChangeCount = @($Events | Where-Object { $_.EventID -eq '4719' }).Count
+    $adminLoginCount = @($Events | Where-Object { $_.EventID -eq '4672' }).Count
+    $explicitCredCount = @($Events | Where-Object { $_.EventID -eq '4648' }).Count
+    $unexpectedShutdownCount = @($Events | Where-Object { $_.EventID -eq '6008' }).Count
     
     $html = "<div class='cards'>"
     $html += "<div class='card'><div class='k'>Total Events</div><div class='v'>$totalEvents</div></div>"
     $html += "<div class='card event-critical'><div class='k'>Critical</div><div class='v'>$criticalCount</div></div>"
     $html += "<div class='card event-warning'><div class='k'>Warning</div><div class='v'>$warningCount</div></div>"
     $html += "<div class='card event-info'><div class='k'>Informational</div><div class='v'>$infoCount</div></div>"
+    $html += "</div>"
+    
+    # Add detailed event type statistics
+    $html += "<div class='cards' style='margin-top: 10px;'>"
+    $html += "<div class='card'><div class='k'>Failed Logons (4625)</div><div class='v'>$failedLogonCount</div><div class='detail'>Password spraying indicator</div></div>"
+    $html += "<div class='card'><div class='k'>Audit Changes (4719)</div><div class='v'>$auditChangeCount</div><div class='detail'>Security settings modified</div></div>"
+    $html += "<div class='card'><div class='k'>Admin Logins (4672)</div><div class='v'>$adminLoginCount</div><div class='detail'>Special privileges assigned</div></div>"
+    $html += "<div class='card'><div class='k'>Explicit Cred (4648)</div><div class='v'>$explicitCredCount</div><div class='detail'>Credential logon attempt</div></div>"
+    $html += "<div class='card'><div class='k'>Unexpected Shutdown (6008)</div><div class='v'>$unexpectedShutdownCount</div><div class='detail'>System crash or power loss</div></div>"
     $html += "</div>"
     
     return $html
@@ -762,6 +808,7 @@ $allEvents = @()
 if (-not $SkipEventLogs) {
     $startTime = (Get-Date).AddHours(-$EventLookbackHours)
     Write-Log "Collecting events from last $EventLookbackHours hour(s)..." -Level INFO
+    Write-Log "Monitoring Event IDs: 4625 (Failed Logon), 4719 (Audit Change), 4672 (Admin Login), 4648 (Explicit Cred), 1100 (Log Shutdown), 6008 (Unexpected Shutdown), 1074 (Planned Shutdown)" -Level INFO
     $allEvents = Collect-AllEvents -DomainControllers $allDcs -StartTime $startTime -MaxConcurrency $MaxConcurrency
 } else {
     Write-Log "Event collection skipped (SkipEventLogs = true)" -Level WARN
@@ -946,6 +993,7 @@ pre {
 <div class='meta'>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</div>
 <div class='meta'>Domain: $(HtmlSafe $domain.DNSRoot) | Forest: $(HtmlSafe $forest.Name) | Domain Controllers: $($dcRows.Count) | AD Sites: $($siteStats.Count)</div>
 <div class='meta'>Event Lookback: $EventLookbackHours hour(s) | Collection Mode: $(if ($DemoMode) { 'Demo' } else { 'Production' })</div>
+<div class='meta'>Monitored Events: 4625, 4719, 4672, 4648, 1100, 6008, 1074</div>
 </div>
 
 <div class='cards'>
@@ -1081,14 +1129,20 @@ $jsonPayload = [pscustomobject]@{
     FsmoIssues = $fsmoDown
     EventStats = @{
         TotalEvents = $allEvents.Count
-        CriticalEvents = @($allEvents | Where-Object { $_.Level -eq 'Critical' }).Count
-        WarningEvents = @($allEvents | Where-Object { $_.Level -eq 'Warning' }).Count
-        InfoEvents = @($allEvents | Where-Object { $_.Level -eq 'Info' }).Count
+        CriticalEvents = @($allEvents | Where-Object { $_.Severity -eq 'Critical' }).Count
+        WarningEvents = @($allEvents | Where-Object { $_.Severity -eq 'Warning' }).Count
+        InfoEvents = @($allEvents | Where-Object { $_.Severity -eq 'Info' }).Count
+        FailedLogonCount = @($allEvents | Where-Object { $_.EventID -eq '4625' }).Count
+        AuditChangeCount = @($allEvents | Where-Object { $_.EventID -eq '4719' }).Count
+        AdminLoginCount = @($allEvents | Where-Object { $_.EventID -eq '4672' }).Count
+        ExplicitCredCount = @($allEvents | Where-Object { $_.EventID -eq '4648' }).Count
+        UnexpectedShutdownCount = @($allEvents | Where-Object { $_.EventID -eq '6008' }).Count
     }
     SiteStats = @($siteStats)
     DomainControllers = @($dcRows | Select-Object Domain, HostName, Site, Reachable, DcStatus)
     FsmoRoles = @($fsmoRows)
     ReplicationFailureRows = @($replFailureRows)
+    MonitoredEvents = @('4625', '4719', '4672', '4648', '1100', '6008', '1074')
 }
 
 $jsonPayload | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonPath -Encoding UTF8
@@ -1110,24 +1164,6 @@ Write-Log "═══════════════════════
     JsonReport = $jsonPath
     OverallStatus = $healthStatus
     EventCount = $allEvents.Count
-    CriticalEventCount = @($allEvents | Where-Object { $_.Level -eq 'Critical' }).Count
+    CriticalEventCount = @($allEvents | Where-Object { $_.Severity -eq 'Critical' }).Count
+    FailedLogonCount = @($allEvents | Where-Object { $_.EventID -eq '4625' }).Count
 }
-
-
-
-
-**************************************************************************************************************************
-
-(4625): Indicates wrong passwords, expired accounts, or potential password-spraying attacks.User Account Management 
-
-(4719): Detects when security auditing settings are modified.Key Security Audit Events 
-
-4672: Special privileges assigned to a new logon (e.g., Administrator login).
-
-4648: A logon was attempted using explicit credentials (often used by attackers).
-
-1100: The event logging service has shut down.
-
-Event ID 6008: Indicates the previous shutdown was unexpected.
-
-Event ID 1074: Logs a planned restart or shutdown initiated by an application or user
