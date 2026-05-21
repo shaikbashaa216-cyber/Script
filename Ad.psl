@@ -39,18 +39,17 @@ param(
     [int]$DemoDomainControllerLimit = 3,
     
     [Parameter(Mandatory = $false)]
-    [ValidateRange(1, 20)]
-    [int]$MaxConcurrency = 10,
-    
-    [Parameter(Mandatory = $false)]
     [ValidateRange(1, 168)]
     [int]$EventLookbackHours = 24,
     
     [Parameter(Mandatory = $false)]
-    [switch]$SkipEventLogs
+    [switch]$SkipEventLogs,
+    
+    [Parameter(Mandatory = $false)]
+    [int]$PortCheckTimeoutMs = 2000
 )
 
-# Set strict error handling - DO NOT EXIT ON ERRORS
+# Set strict error handling
 $ErrorActionPreference = 'Continue'
 $WarningPreference = 'SilentlyContinue'
 
@@ -84,9 +83,6 @@ function Write-HealthRunbook {
         '',
         'Custom output folder:',
         '  powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -OutputDirectory D:\Reports\ADHealth',
-        '',
-        'Large environment (faster parallel collection):',
-        '  powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -MaxConcurrency 15',
         '',
         'Extend event lookback period:',
         '  powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -EventLookbackHours 48',
@@ -126,67 +122,198 @@ function Get-SvcBadge {
 
 
 # =============================================================================
-# SECTION 2: DOMAIN CONTROLLER HEALTH FUNCTIONS (Synchronous - More Stable)
+# SECTION 2: IMPROVED CONNECTIVITY AND SERVICE DETECTION
 # =============================================================================
 
-function Test-DCConnectivity {
-    param([string]$ComputerName)
+function Test-DCReachability {
+    <#
+    .SYNOPSIS
+        Tests if a domain controller is reachable using multiple methods
+    #>
+    param(
+        [string]$ComputerName,
+        [int]$TimeoutMs = 2000
+    )
+    
+    # Method 1: Test-Connection (ICMP ping)
     try {
-        return [bool](Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction Stop -TimeoutSeconds 5)
+        $ping = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction Stop -TimeoutSeconds 5
+        if ($ping) {
+            Write-Log "$ComputerName is reachable via ICMP ping" -Level INFO
+            return $true
+        }
     }
     catch {
-        return $false
+        Write-Log "ICMP ping to $ComputerName failed: $($_.Exception.Message)" -Level WARN
     }
+    
+    # Method 2: Test TCP port 445 (SMB - core AD service port)
+    try {
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $asyncResult = $tcpClient.BeginConnect($ComputerName, 445, $null, $null)
+        $wait = $asyncResult.AsyncWaitHandle.WaitOne($TimeoutMs)
+        if ($wait) {
+            $tcpClient.EndConnect($asyncResult)
+            $tcpClient.Close()
+            Write-Log "$ComputerName is reachable via TCP 445 (SMB)" -Level INFO
+            return $true
+        }
+        $tcpClient.Close()
+    }
+    catch {
+        Write-Log "TCP 445 test to $ComputerName failed: $($_.Exception.Message)" -Level WARN
+    }
+    
+    # Method 3: Test TCP port 389 (LDAP)
+    try {
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $asyncResult = $tcpClient.BeginConnect($ComputerName, 389, $null, $null)
+        $wait = $asyncResult.AsyncWaitHandle.WaitOne($TimeoutMs)
+        if ($wait) {
+            $tcpClient.EndConnect($asyncResult)
+            $tcpClient.Close()
+            Write-Log "$ComputerName is reachable via TCP 389 (LDAP)" -Level INFO
+            return $true
+        }
+        $tcpClient.Close()
+    }
+    catch {
+        Write-Log "TCP 389 test to $ComputerName failed: $($_.Exception.Message)" -Level WARN
+    }
+    
+    # Method 4: DNS resolution check
+    try {
+        $dnsResult = [System.Net.Dns]::GetHostAddresses($ComputerName)
+        if ($dnsResult -and $dnsResult.Count -gt 0) {
+            Write-Log "$ComputerName resolved to IP: $($dnsResult[0].IPAddressToString)" -Level INFO
+            return $true
+        }
+    }
+    catch {
+        Write-Log "DNS resolution for $ComputerName failed: $($_.Exception.Message)" -Level WARN
+    }
+    
+    Write-Log "$ComputerName is NOT reachable via any method" -Level WARN
+    return $false
 }
 
-function Get-DCServices {
+function Get-DCServicesImproved {
+    <#
+    .SYNOPSIS
+        Gets service status for critical AD services using multiple methods
+    #>
     param(
         [string]$ComputerName,
         [bool]$IsReachable
     )
     
-    $services = @{ NTDS = 'Unknown'; Netlogon = 'Unknown'; KDC = 'Unknown'; DFSR = 'Unknown'; DNS = 'Unknown' }
+    $services = @{ 
+        NTDS = 'Unknown'
+        Netlogon = 'Unknown'
+        KDC = 'Unknown'
+        DFSR = 'Unknown'
+        DNS = 'Unknown'
+    }
     
     if (-not $IsReachable) {
+        Write-Log "$ComputerName is not reachable, skipping service checks" -Level WARN
         return $services
     }
     
-    $serviceNames = @('NTDS', 'Netlogon', 'KDC', 'DFSR', 'DNS')
-    foreach ($serviceName in $serviceNames) {
+    # Service names and their display names
+    $serviceMap = @{
+        'NTDS' = 'NTDS'
+        'Netlogon' = 'Netlogon'
+        'KDC' = 'kdc'
+        'DFSR' = 'DFSR'
+        'DNS' = 'DNS'
+    }
+    
+    # Method 1: Get-Service with explicit credentials (using current context)
+    foreach ($svcName in $serviceMap.Keys) {
         try {
-            $svc = Get-Service -ComputerName $ComputerName -Name $serviceName -ErrorAction Stop
-            $services[$serviceName] = $svc.Status.ToString()
+            $svc = Get-Service -ComputerName $ComputerName -Name $serviceMap[$svcName] -ErrorAction Stop
+            $services[$svcName] = $svc.Status.ToString()
+            Write-Log "$ComputerName - $svcName service is $($svc.Status)" -Level INFO
         }
         catch {
-            # Keep as Unknown
+            Write-Log "Get-Service failed for $ComputerName - $svcName : $($_.Exception.Message)" -Level WARN
+            
+            # Method 2: Try using WMI as fallback
+            try {
+                $wmiService = Get-CimInstance -ClassName Win32_Service -ComputerName $ComputerName -Filter "Name='$($serviceMap[$svcName])'" -ErrorAction Stop
+                if ($wmiService) {
+                    $services[$svcName] = $wmiService.State
+                    Write-Log "$ComputerName - $svcName (via WMI) is $($wmiService.State)" -Level INFO
+                }
+            }
+            catch {
+                Write-Log "WMI also failed for $ComputerName - $svcName : $($_.Exception.Message)" -Level WARN
+            }
         }
     }
     
     return $services
 }
 
-function Check-DCHealth {
+function Check-DCHealthImproved {
+    <#
+    .SYNOPSIS
+        Comprehensive health check for a single domain controller
+    #>
     param(
         [string]$HostName,
         [string]$Domain,
         [string]$Site,
-        [string]$IPv4
+        [string]$IPv4,
+        [int]$PortCheckTimeoutMs
     )
     
-    $reachable = Test-DCConnectivity -ComputerName $HostName
-    $services = Get-DCServices -ComputerName $HostName -IsReachable $reachable
+    Write-Log "Checking DC: $HostName" -Level INFO
     
+    # Test reachability using multiple methods
+    $reachable = Test-DCReachability -ComputerName $HostName -TimeoutMs $PortCheckTimeoutMs
+    
+    # Get service status if reachable
+    $services = Get-DCServicesImproved -ComputerName $HostName -IsReachable $reachable
+    
+    # Determine DC status
     $anyBad = $false
-    foreach ($svcStatus in $services.Values) {
-        if ($svcStatus -ne 'Running' -and $svcStatus -ne 'Unknown') {
+    $anyRunning = $false
+    
+    foreach ($svcName in @('NTDS', 'Netlogon', 'KDC')) {
+        $status = $services[$svcName]
+        if ($status -eq 'Running') {
+            $anyRunning = $true
+        }
+        elseif ($status -ne 'Unknown' -and $status -ne 'Running') {
             $anyBad = $true
-            break
         }
     }
     
-    $dcStatus = if (-not $reachable) { 'Red' } 
-                elseif ($anyBad) { 'Yellow' } 
-                else { 'Green' }
+    # A DC is considered healthy if:
+    # - It's reachable, AND
+    # - At least NTDS is running (or we can't determine but it's reachable)
+    $dcStatus = if (-not $reachable) { 
+        'Red' 
+    } 
+    elseif ($anyBad) { 
+        'Yellow' 
+    }
+    elseif ($anyRunning -or $reachable) {
+        # If reachable, consider it at least Yellow/Green even if services unknown
+        if ($services['NTDS'] -eq 'Running' -and $services['Netlogon'] -eq 'Running') {
+            'Green'
+        } else {
+            'Yellow'
+        }
+    }
+    else {
+        'Yellow'
+    }
+    
+    # Log final status
+    Write-Log "$HostName - Reachable: $reachable, Status: $dcStatus, NTDS: $($services['NTDS'])" -Level INFO
     
     return [pscustomobject]@{
         Domain      = $Domain
@@ -205,7 +332,8 @@ function Check-DCHealth {
 
 function Collect-DCHealth {
     param(
-        [array]$DomainControllers
+        [array]$DomainControllers,
+        [int]$PortCheckTimeoutMs
     )
     
     Write-Log "Collecting health for $($DomainControllers.Count) domain controllers..." -Level OK
@@ -219,35 +347,36 @@ function Collect-DCHealth {
         Write-Log "Processing DC $current of $total : $($dc.HostName)" -Level INFO
         
         try {
-            $result = Check-DCHealth -HostName $dc.HostName -Domain $dc.Domain -Site $dc.Site -IPv4 $dc.IPv4Address
+            $result = Check-DCHealthImproved -HostName $dc.HostName -Domain $dc.Domain -Site $dc.Site -IPv4 $dc.IPv4Address -PortCheckTimeoutMs $PortCheckTimeoutMs
             $dcRows += $result
         }
         catch {
-            Write-Log "Failed to process DC $($dc.HostName): $($_.Exception.Message)" -Level WARN
-            # Add a placeholder for failed DC
+            Write-Log "Failed to process DC $($dc.HostName): $($_.Exception.Message)" -Level ERROR
+            # Add a placeholder for failed DC with more details
             $dcRows += [pscustomobject]@{
                 Domain      = $dc.Domain
                 HostName    = $dc.HostName
                 Site        = $dc.Site
                 IPv4Address = $dc.IPv4Address
                 Reachable   = $false
-                NTDS        = 'Unknown'
-                Netlogon    = 'Unknown'
-                KDC         = 'Unknown'
-                DFSR        = 'Unknown'
-                DNS         = 'Unknown'
+                NTDS        = 'Error'
+                Netlogon    = 'Error'
+                KDC         = 'Error'
+                DFSR        = 'Error'
+                DNS         = 'Error'
                 DcStatus    = 'Red'
             }
         }
     }
     
-    Write-Log "Health collection complete. $($dcRows.Count) results." -Level OK
+    $reachableCount = @($dcRows | Where-Object { $_.Reachable -eq $true }).Count
+    Write-Log "Health collection complete. $reachableCount of $total DCs are reachable." -Level OK
     return $dcRows
 }
 
 
 # =============================================================================
-# SECTION 3: EVENT LOG COLLECTION FUNCTIONS (Synchronous)
+# SECTION 3: EVENT LOG COLLECTION FUNCTIONS
 # =============================================================================
 
 function Get-EventsFromDC {
@@ -380,7 +509,7 @@ function Get-FSMORoleStatus {
     # PDC Emulator
     try {
         $holder = $Domain.PDCEmulator
-        $ok = Test-DCConnectivity -ComputerName $holder
+        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 2000
         $fsmoRows += [pscustomobject]@{ Role = 'PDC Emulator'; Holder = $holder; Reachable = $ok }
     }
     catch {
@@ -390,7 +519,7 @@ function Get-FSMORoleStatus {
     # RID Master
     try {
         $holder = $Domain.RIDMaster
-        $ok = Test-DCConnectivity -ComputerName $holder
+        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 2000
         $fsmoRows += [pscustomobject]@{ Role = 'RID Master'; Holder = $holder; Reachable = $ok }
     }
     catch {
@@ -400,7 +529,7 @@ function Get-FSMORoleStatus {
     # Infrastructure Master
     try {
         $holder = $Domain.InfrastructureMaster
-        $ok = Test-DCConnectivity -ComputerName $holder
+        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 2000
         $fsmoRows += [pscustomobject]@{ Role = 'Infrastructure Master'; Holder = $holder; Reachable = $ok }
     }
     catch {
@@ -410,7 +539,7 @@ function Get-FSMORoleStatus {
     # Schema Master
     try {
         $holder = $Forest.SchemaMaster
-        $ok = Test-DCConnectivity -ComputerName $holder
+        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 2000
         $fsmoRows += [pscustomobject]@{ Role = 'Schema Master'; Holder = $holder; Reachable = $ok }
     }
     catch {
@@ -420,7 +549,7 @@ function Get-FSMORoleStatus {
     # Domain Naming Master
     try {
         $holder = $Forest.DomainNamingMaster
-        $ok = Test-DCConnectivity -ComputerName $holder
+        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 2000
         $fsmoRows += [pscustomobject]@{ Role = 'Domain Naming Master'; Holder = $holder; Reachable = $ok }
     }
     catch {
@@ -589,7 +718,7 @@ function Build-ReplicationFailHtml {
                  "<td>$(HtmlSafe $r.FailureCount)</td>" +
                  "<td>$(HtmlSafe $r.FirstFailureTime)</td>" +
                  "<td>$(HtmlSafe $r.LastFailureTime)</td>" +
-                 "</tr>"
+                 "</table>"
     }
     
     return ($html -join [Environment]::NewLine)
@@ -695,7 +824,7 @@ function Build-EventsHtml {
         $html += "<td><span class='event-badge $severityClass'>$(HtmlSafe $event.Severity)</span></td>"
         $html += "<td><div class='event-message'>$(HtmlSafe $event.Description)</div></td>"
         $html += "<td><div class='event-message'>$(HtmlSafe $shortMessage)</div></td>"
-        $html += "</tr>"
+        $html += "<tr>"
         $count++
     }
     
@@ -710,8 +839,7 @@ function Build-EventStatsCards {
     $warningCount = @($Events | Where-Object { $_.Severity -eq 'Warning' }).Count
     $infoCount = @($Events | Where-Object { $_.Severity -eq 'Info' }).Count
     
-    $totalEvents = $Events.Count
-    
+    $totalEvents = $Events.Count    
     $failedLogonCount = @($Events | Where-Object { $_.EventID -eq '4625' }).Count
     $auditChangeCount = @($Events | Where-Object { $_.EventID -eq '4719' }).Count
     $adminLoginCount = @($Events | Where-Object { $_.EventID -eq '4672' }).Count
@@ -780,7 +908,7 @@ try {
     }
     
     # Collect DC health
-    $dcRows = Collect-DCHealth -DomainControllers $allDcs
+    $dcRows = Collect-DCHealth -DomainControllers $allDcs -PortCheckTimeoutMs $PortCheckTimeoutMs
     
     # Collect FSMO and replication data
     Write-Log "Collecting FSMO role status..." -Level INFO
@@ -807,8 +935,8 @@ try {
     }
     
     # Calculate health status
-    $reachableCount = @($dcRows | Where-Object { $_.Reachable }).Count
-    $unreachableCount = @($dcRows | Where-Object { -not $_.Reachable }).Count
+    $reachableCount = @($dcRows | Where-Object { $_.Reachable -eq $true }).Count
+    $unreachableCount = @($dcRows | Where-Object { $_.Reachable -eq $false }).Count
     $issueRows = @($dcRows | Where-Object { $_.DcStatus -ne 'Green' })
     $fsmoDown = @($fsmoRows | Where-Object { -not $_.Reachable }).Count
     $replIssueCount = $replFailureRows.Count
@@ -847,7 +975,7 @@ try {
     Write-Log "Exported DC CSV: $dcCsv" -Level OK
     Write-Log "Exported Events CSV: $eventCsv" -Level OK
     
-    # Generate HTML content
+    # Generate HTML content (same as before - keeping it compact)
     $htmlContent = @"
 <!DOCTYPE html>
 <html lang='en'>
