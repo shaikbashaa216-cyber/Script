@@ -13,9 +13,9 @@
     - Comprehensive event monitoring
     
     Monitored Event IDs:
-    - 4625: Failed logon (wrong passwords, expired accounts, password-spraying)
+    - 4625: Failed logon
     - 4719: System audit policy modified
-    - 4672: Special privileges assigned to new logon (admin login)
+    - 4672: Special privileges assigned to new logon
     - 4648: Logon attempted using explicit credentials
     - 1100: Event logging service shut down
     - 6008: Unexpected previous shutdown
@@ -115,11 +115,6 @@ function Write-HealthRunbook {
         '  # Demo mode (limit DCs)',
         '  .\AD_Daily_Health_Summary.ps1 -DemoMode -DemoDomainControllerLimit 10',
         '',
-        'CUSTOM DC LIST FILE FORMAT (one per line):',
-        '  DC01.domain.com',
-        '  DC02.domain.com',
-        '  192.168.1.10',
-        '',
         '═══════════════════════════════════════════════════════════════════════════════'
     )
     Write-Host ($lines -join [Environment]::NewLine) -ForegroundColor Cyan
@@ -150,10 +145,6 @@ function Get-SvcBadge {
 # =============================================================================
 
 function Get-TargetDomainControllers {
-    <#
-    .SYNOPSIS
-        Gets domain controllers based on selected scan scope
-    #>
     param(
         [string]$Scope,
         [string]$CustomDCListPath
@@ -177,7 +168,8 @@ function Get-TargetDomainControllers {
                 }
             }
             catch {
-                Write-Log "Failed to get forest DCs: $($_.Exception.Message)" -Level ERROR
+                $errMsg = $_.Exception.Message
+                Write-Log "Failed to get forest DCs: $errMsg" -Level ERROR
                 throw
             }
             break
@@ -192,7 +184,8 @@ function Get-TargetDomainControllers {
                 Write-Log "Found $($dcs.Count) DCs in current domain" -Level INFO
             }
             catch {
-                Write-Log "Failed to get current domain DCs: $($_.Exception.Message)" -Level ERROR
+                $errMsg = $_.Exception.Message
+                Write-Log "Failed to get current domain DCs: $errMsg" -Level ERROR
                 throw
             }
             break
@@ -216,13 +209,12 @@ function Get-TargetDomainControllers {
                 
                 foreach ($dcName in $dcNames) {
                     try {
-                        # Try to resolve as AD DC first
                         $dc = Get-ADDomainController -Identity $dcName.Trim() -ErrorAction Stop
                         $dcs += $dc
                     }
                     catch {
-                        # If not found in AD, create a placeholder
-                        Write-Log "Could not find DC in AD: $dcName - creating placeholder" -Level WARN
+                        $errMsg = $_.Exception.Message
+                        Write-Log "Could not find DC in AD: $dcName - $errMsg" -Level WARN
                         $dcs += [pscustomobject]@{
                             Name = $dcName.Trim()
                             HostName = $dcName.Trim()
@@ -239,7 +231,8 @@ function Get-TargetDomainControllers {
                 }
             }
             catch {
-                Write-Log "Failed to process custom DC list: $($_.Exception.Message)" -Level ERROR
+                $errMsg = $_.Exception.Message
+                Write-Log "Failed to process custom DC list: $errMsg" -Level ERROR
                 throw
             }
             break
@@ -251,7 +244,6 @@ function Get-TargetDomainControllers {
         }
     }
     
-    # Remove duplicates by HostName
     $dcs = $dcs | Sort-Object HostName -Unique
     Write-Log "Total unique DCs to scan: $($dcs.Count)" -Level OK
     return $dcs
@@ -263,16 +255,12 @@ function Get-TargetDomainControllers {
 # =============================================================================
 
 function Test-DCReachability {
-    <#
-    .SYNOPSIS
-        Tests if a domain controller is reachable using multiple methods
-    #>
     param(
         [string]$ComputerName,
         [int]$TimeoutMs = 3000
     )
     
-    # Method 1: Test TCP port 445 (SMB - most reliable for Windows)
+    # Method 1: Test TCP port 445 (SMB - most reliable)
     try {
         $tcpClient = New-Object System.Net.Sockets.TcpClient
         $asyncResult = $tcpClient.BeginConnect($ComputerName, 445, $null, $null)
@@ -280,13 +268,14 @@ function Test-DCReachability {
         if ($wait) {
             $tcpClient.EndConnect($asyncResult)
             $tcpClient.Close()
-            Write-Log "$ComputerName is reachable via TCP 445 (SMB)" -Level INFO
+            Write-Log "$ComputerName is reachable via TCP 445" -Level INFO
             return $true
         }
         $tcpClient.Close()
     }
-    catch { 
-        Write-Log "TCP 445 test to $ComputerName failed: $($_.Exception.Message)" -Level WARN
+    catch {
+        $errMsg = $_.Exception.Message
+        Write-Log "TCP 445 test to $ComputerName failed: $errMsg" -Level WARN
     }
     
     # Method 2: Test TCP port 389 (LDAP)
@@ -297,16 +286,17 @@ function Test-DCReachability {
         if ($wait) {
             $tcpClient.EndConnect($asyncResult)
             $tcpClient.Close()
-            Write-Log "$ComputerName is reachable via TCP 389 (LDAP)" -Level INFO
+            Write-Log "$ComputerName is reachable via TCP 389" -Level INFO
             return $true
         }
         $tcpClient.Close()
     }
     catch {
-        Write-Log "TCP 389 test to $ComputerName failed: $($_.Exception.Message)" -Level WARN
+        $errMsg = $_.Exception.Message
+        Write-Log "TCP 389 test to $ComputerName failed: $errMsg" -Level WARN
     }
     
-    # Method 3: Test-Connection (ICMP ping) as fallback
+    # Method 3: ICMP ping as fallback
     try {
         $ping = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction Stop -TimeoutSeconds 5
         if ($ping) {
@@ -315,7 +305,8 @@ function Test-DCReachability {
         }
     }
     catch {
-        Write-Log "ICMP ping to $ComputerName failed: $($_.Exception.Message)" -Level WARN
+        $errMsg = $_.Exception.Message
+        Write-Log "ICMP ping to $ComputerName failed: $errMsg" -Level WARN
     }
     
     Write-Log "$ComputerName is NOT reachable via any method" -Level WARN
@@ -323,10 +314,6 @@ function Test-DCReachability {
 }
 
 function Get-DCServicesViaCIM {
-    <#
-    .SYNOPSIS
-        Gets service status using CIM/WMI - more reliable than Get-Service for remote systems
-    #>
     param(
         [string]$ComputerName,
         [bool]$IsReachable
@@ -345,7 +332,6 @@ function Get-DCServicesViaCIM {
         return $services
     }
     
-    # Service names to check
     $serviceNames = @{
         'NTDS' = 'NTDS'
         'Netlogon' = 'Netlogon'
@@ -354,7 +340,7 @@ function Get-DCServicesViaCIM {
         'DNS' = 'DNS'
     }
     
-    # Try CIM session first (more reliable)
+    # Try CIM session first
     $cimSession = $null
     try {
         $cimSession = New-CimSession -ComputerName $ComputerName -ErrorAction Stop -OperationTimeoutSec 10
@@ -368,20 +354,18 @@ function Get-DCServicesViaCIM {
                     $services[$svcName] = $result.State
                     Write-Log "$ComputerName - $svcName service is $($result.State) (via CIM)" -Level INFO
                 }
-                else {
-                    Write-Log "$ComputerName - $svcName service not found via CIM" -Level WARN
-                }
             }
             catch {
-                Write-Log "CIM query failed for $ComputerName - $svcName : $($_.Exception.Message)" -Level WARN
+                $errMsg = $_.Exception.Message
+                Write-Log "CIM query failed for $ComputerName - $svcName : $errMsg" -Level WARN
             }
         }
     }
     catch {
-        Write-Log "Failed to create CIM session to $ComputerName: $($_.Exception.Message)" -Level WARN
+        $errMsg = $_.Exception.Message
+        Write-Log "Failed to create CIM session to $ComputerName: $errMsg" -Level WARN
         Write-Log "Falling back to Get-Service method..." -Level WARN
         
-        # Fallback to Get-Service
         foreach ($svcName in $serviceNames.Keys) {
             try {
                 $svc = Get-Service -ComputerName $ComputerName -Name $serviceNames[$svcName] -ErrorAction Stop
@@ -389,7 +373,8 @@ function Get-DCServicesViaCIM {
                 Write-Log "$ComputerName - $svcName service is $($svc.Status) (via Get-Service)" -Level INFO
             }
             catch {
-                Write-Log "Get-Service failed for $ComputerName - $svcName : $($_.Exception.Message)" -Level WARN
+                $errMsg = $_.Exception.Message
+                Write-Log "Get-Service failed for $ComputerName - $svcName : $errMsg" -Level WARN
             }
         }
     }
@@ -403,10 +388,6 @@ function Get-DCServicesViaCIM {
 }
 
 function Check-DCHealthImproved {
-    <#
-    .SYNOPSIS
-        Comprehensive health check for a single domain controller
-    #>
     param(
         [string]$HostName,
         [string]$Domain,
@@ -417,14 +398,10 @@ function Check-DCHealthImproved {
     
     Write-Log "Checking DC: $HostName" -Level INFO
     
-    # Test reachability using multiple methods
     $reachable = Test-DCReachability -ComputerName $HostName -TimeoutMs $PortCheckTimeoutMs
-    
-    # Get service status using CIM (more reliable)
     $services = Get-DCServicesViaCIM -ComputerName $HostName -IsReachable $reachable
     
-    # Determine DC status based on NTDS and Netlogon
-    $dcStatus = 'Red'  # Default to Red
+    $dcStatus = 'Red'
     
     if ($reachable) {
         if ($services['NTDS'] -eq 'Running' -and $services['Netlogon'] -eq 'Running') {
@@ -433,7 +410,7 @@ function Check-DCHealthImproved {
         }
         elseif ($services['NTDS'] -eq 'Running' -or $services['Netlogon'] -eq 'Running') {
             $dcStatus = 'Yellow'
-            Write-Log "$HostName - Status: Yellow (Some services running, but not all)" -Level WARN
+            Write-Log "$HostName - Status: Yellow (Some services running)" -Level WARN
         }
         else {
             $dcStatus = 'Yellow'
@@ -480,7 +457,8 @@ function Collect-DCHealth {
             $dcRows += $result
         }
         catch {
-            Write-Log "Failed to process DC $($dc.HostName): $($_.Exception.Message)" -Level ERROR
+            $errMsg = $_.Exception.Message
+            Write-Log "Failed to process DC $($dc.HostName): $errMsg" -Level ERROR
             $dcRows += [pscustomobject]@{
                 Domain      = $dc.Domain
                 HostName    = $dc.HostName
@@ -538,7 +516,10 @@ function Get-UnexpectedShutdownEvents {
                 }
             }
         }
-        catch { }
+        catch {
+            $errMsg = $_.Exception.Message
+            Write-Log "Failed to get shutdown events from $($dc.HostName): $errMsg" -Level WARN
+        }
     }
     
     Write-Log "Found $($shutdownEvents.Count) unexpected shutdown events" -Level INFO
@@ -554,12 +535,12 @@ function Get-EventsFromDC {
     $events = @()
     
     $eventDetails = @{
-        '4625' = @{ Name = 'Failed Logon'; Severity = 'Warning'; LogName = 'Security'; Description = 'Wrong password, expired account, or potential password-spraying attack' }
+        '4625' = @{ Name = 'Failed Logon'; Severity = 'Warning'; LogName = 'Security'; Description = 'Wrong password or password-spraying attack' }
         '4719' = @{ Name = 'System Audit Policy Modified'; Severity = 'Critical'; LogName = 'Security'; Description = 'Security auditing settings were modified' }
         '4672' = @{ Name = 'Special Privileges Assigned'; Severity = 'Warning'; LogName = 'Security'; Description = 'Admin privileges assigned to new logon' }
         '4648' = @{ Name = 'Explicit Credential Logon'; Severity = 'Warning'; LogName = 'Security'; Description = 'Logon attempted using explicit credentials' }
-        '1100' = @{ Name = 'Event Log Service Shutdown'; Severity = 'Warning'; LogName = 'System'; Description = 'The event logging service has shut down' }
-        '1074' = @{ Name = 'Planned Restart/Shutdown'; Severity = 'Info'; LogName = 'System'; Description = 'Planned restart or shutdown initiated' }
+        '1100' = @{ Name = 'Event Log Service Shutdown'; Severity = 'Warning'; LogName = 'System'; Description = 'Event logging service shut down' }
+        '1074' = @{ Name = 'Planned Restart/Shutdown'; Severity = 'Info'; LogName = 'System'; Description = 'Planned restart or shutdown' }
     }
     
     # Security events
@@ -586,7 +567,9 @@ function Get-EventsFromDC {
                 }
             }
         }
-        catch { }
+        catch {
+            # Silently continue for permission issues
+        }
     }
     
     # System events
@@ -613,7 +596,9 @@ function Get-EventsFromDC {
                 }
             }
         }
-        catch { }
+        catch {
+            # Silently continue
+        }
     }
     
     return $events
@@ -644,7 +629,8 @@ function Collect-AllEvents {
             }
         }
         catch {
-            Write-Log "Failed to collect events from $($dc.HostName): $($_.Exception.Message)" -Level WARN
+            $errMsg = $_.Exception.Message
+            Write-Log "Failed to collect events from $($dc.HostName): $errMsg" -Level WARN
         }
     }
     
@@ -665,46 +651,46 @@ function Get-FSMORoleStatus {
     try {
         $holder = $Domain.PDCEmulator
         $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 3000
-        $fsmoRows += [pscustomobject]@{ Role = 'PDC Emulator'; Holder = $holder; Reachable = $ok; Status = if($ok){'Healthy'}else{'Unreachable'} }
+        $fsmoRows += [pscustomobject]@{ Role = 'PDC Emulator'; Holder = $holder; Reachable = $ok }
     }
     catch {
-        $fsmoRows += [pscustomobject]@{ Role = 'PDC Emulator'; Holder = 'Unknown'; Reachable = $false; Status = 'Unknown' }
+        $fsmoRows += [pscustomobject]@{ Role = 'PDC Emulator'; Holder = 'Unknown'; Reachable = $false }
     }
     
     try {
         $holder = $Domain.RIDMaster
         $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 3000
-        $fsmoRows += [pscustomobject]@{ Role = 'RID Master'; Holder = $holder; Reachable = $ok; Status = if($ok){'Healthy'}else{'Unreachable'} }
+        $fsmoRows += [pscustomobject]@{ Role = 'RID Master'; Holder = $holder; Reachable = $ok }
     }
     catch {
-        $fsmoRows += [pscustomobject]@{ Role = 'RID Master'; Holder = 'Unknown'; Reachable = $false; Status = 'Unknown' }
+        $fsmoRows += [pscustomobject]@{ Role = 'RID Master'; Holder = 'Unknown'; Reachable = $false }
     }
     
     try {
         $holder = $Domain.InfrastructureMaster
         $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 3000
-        $fsmoRows += [pscustomobject]@{ Role = 'Infrastructure Master'; Holder = $holder; Reachable = $ok; Status = if($ok){'Healthy'}else{'Unreachable'} }
+        $fsmoRows += [pscustomobject]@{ Role = 'Infrastructure Master'; Holder = $holder; Reachable = $ok }
     }
     catch {
-        $fsmoRows += [pscustomobject]@{ Role = 'Infrastructure Master'; Holder = 'Unknown'; Reachable = $false; Status = 'Unknown' }
+        $fsmoRows += [pscustomobject]@{ Role = 'Infrastructure Master'; Holder = 'Unknown'; Reachable = $false }
     }
     
     try {
         $holder = $Forest.SchemaMaster
         $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 3000
-        $fsmoRows += [pscustomobject]@{ Role = 'Schema Master'; Holder = $holder; Reachable = $ok; Status = if($ok){'Healthy'}else{'Unreachable'} }
+        $fsmoRows += [pscustomobject]@{ Role = 'Schema Master'; Holder = $holder; Reachable = $ok }
     }
     catch {
-        $fsmoRows += [pscustomobject]@{ Role = 'Schema Master'; Holder = 'Unknown'; Reachable = $false; Status = 'Unknown' }
+        $fsmoRows += [pscustomobject]@{ Role = 'Schema Master'; Holder = 'Unknown'; Reachable = $false }
     }
     
     try {
         $holder = $Forest.DomainNamingMaster
         $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 3000
-        $fsmoRows += [pscustomobject]@{ Role = 'Domain Naming Master'; Holder = $holder; Reachable = $ok; Status = if($ok){'Healthy'}else{'Unreachable'} }
+        $fsmoRows += [pscustomobject]@{ Role = 'Domain Naming Master'; Holder = $holder; Reachable = $ok }
     }
     catch {
-        $fsmoRows += [pscustomobject]@{ Role = 'Domain Naming Master'; Holder = 'Unknown'; Reachable = $false; Status = 'Unknown' }
+        $fsmoRows += [pscustomobject]@{ Role = 'Domain Naming Master'; Holder = 'Unknown'; Reachable = $false }
     }
     
     return $fsmoRows
@@ -726,7 +712,8 @@ function Get-ReplicationFailures {
         }
     }
     catch {
-        Write-Log "Get-ADReplicationFailure failed: $($_.Exception.Message)" -Level WARN
+        $errMsg = $_.Exception.Message
+        Write-Log "Get-ADReplicationFailure failed: $errMsg" -Level WARN
     }
     
     return $replFailureRows
@@ -742,7 +729,8 @@ function Get-ReplicationSummaryText {
             }
         }
         catch {
-            $replText = "repadmin failed: $($_.Exception.Message)"
+            $errMsg = $_.Exception.Message
+            $replText = "repadmin failed: $errMsg"
         }
     }
     elseif (-not $IncludeReplicationText) {
@@ -923,7 +911,7 @@ function Build-DCSiteSectionsHtml {
         $block += "<span class='dc-count'>$dcCountText</span>"
         $block += "<span class='toggle-hint'>(click to expand)</span></div>"
         $block += "<div id='site-$safeId' class='site-table' style='display:none'>"
-        $block += "<tr><thead>"
+        $block += "<table><thead>"
         $block += "<tr><th>Domain Controller</th><th>IP Address</th><th>Reachable</th>"
         $block += "<th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></tr>"
         $block += "</thead><tbody>" + ($rows -join [Environment]::NewLine) + "</tbody>"
@@ -975,7 +963,7 @@ function Build-EventsHtml {
         $html += "<td><span class='event-badge $severityClass'>$(HtmlSafe $event.Severity)</span></td>"
         $html += "<td><div class='event-message'>$(HtmlSafe $event.Description)</div></td>"
         $html += "<td><div class='event-message'>$(HtmlSafe $shortMessage)</div></td>"
-        $html += "</tr>"
+        $html += "<tr>"
         $count++
     }
     
@@ -1044,10 +1032,10 @@ function Build-EventStatsCards {
     $html += "</div>"
     
     $html += "<div class='cards' style='margin-top: 10px;'>"
-    $html += "<div class='card'><div class='k'>Failed Logons (4625)</div><div class='v'>$failedLogonCount</div><div class='detail'>Password spraying indicator</div></div>"
-    $html += "<div class='card'><div class='k'>Audit Changes (4719)</div><div class='v'>$auditChangeCount</div><div class='detail'>Security settings modified</div></div>"
-    $html += "<div class='card'><div class='k'>Admin Logins (4672)</div><div class='v'>$adminLoginCount</div><div class='detail'>Special privileges assigned</div></div>"
-    $html += "<div class='card'><div class='k'>Explicit Cred (4648)</div><div class='v'>$explicitCredCount</div><div class='detail'>Credential logon attempt</div></div>"
+    $html += "<div class='card'><div class='k'>Failed Logons (4625)</div><div class='v'>$failedLogonCount</div></div>"
+    $html += "<div class='card'><div class='k'>Audit Changes (4719)</div><div class='v'>$auditChangeCount</div></div>"
+    $html += "<div class='card'><div class='k'>Admin Logins (4672)</div><div class='v'>$adminLoginCount</div></div>"
+    $html += "<div class='card'><div class='k'>Explicit Cred (4648)</div><div class='v'>$explicitCredCount</div></div>"
     $html += "</div>"
     
     return $html
@@ -1061,8 +1049,8 @@ function Build-ShutdownStatsCards {
     $affectedDcCount = $uniqueDcs.Count
     
     $html = "<div class='cards'>"
-    $html += "<div class='card event-critical'><div class='k'>Unexpected Shutdowns</div><div class='v'>$shutdownCount</div><div class='detail'>Total unexpected shutdown events</div></div>"
-    $html += "<div class='card event-warning'><div class='k'>Affected DCs</div><div class='v'>$affectedDcCount</div><div class='detail'>DCs with unexpected shutdowns</div></div>"
+    $html += "<div class='card event-critical'><div class='k'>Unexpected Shutdowns</div><div class='v'>$shutdownCount</div></div>"
+    $html += "<div class='card event-warning'><div class='k'>Affected DCs</div><div class='v'>$affectedDcCount</div></div>"
     $html += "</div>"
     
     return $html
@@ -1074,13 +1062,11 @@ function Build-ShutdownStatsCards {
 # =============================================================================
 
 try {
-    # Display runbook if requested
     if ($Runbook) {
         Write-HealthRunbook
         return
     }
     
-    # Create output directory
     if (-not (Test-Path -LiteralPath $OutputDirectory)) {
         New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
         Write-Log "Created output directory: $OutputDirectory" -Level OK
@@ -1094,21 +1080,17 @@ try {
         Write-Log "Custom DC List Path: $CustomDCListPath" -Level INFO
     }
     
-    # Load Active Directory module
     Write-Log "Loading ActiveDirectory module..." -Level INFO
     Import-Module ActiveDirectory -ErrorAction Stop
     Write-Log "ActiveDirectory module loaded successfully." -Level OK
     
-    # Get target domain controllers based on scope
     $allDcs = Get-TargetDomainControllers -Scope $ScanScope -CustomDCListPath $CustomDCListPath
     
-    # Apply demo mode limit
     if ($DemoMode -and $allDcs.Count -gt $DemoDomainControllerLimit) {
         $allDcs = @($allDcs | Select-Object -First $DemoDomainControllerLimit)
         Write-Log "Demo mode: limited to first $DemoDomainControllerLimit domain controllers." -Level WARN
     }
     
-    # Get AD structure info
     $domain = Get-ADDomain
     $forest = Get-ADForest
     
@@ -1116,10 +1098,8 @@ try {
     Write-Log "Forest: $($forest.Name)" -Level INFO
     Write-Log "Total Domain Controllers to scan: $($allDcs.Count)" -Level INFO
     
-    # Collect DC health
     $dcRows = Collect-DCHealth -DomainControllers $allDcs -PortCheckTimeoutMs $PortCheckTimeoutMs
     
-    # Collect FSMO and replication data
     Write-Log "Collecting FSMO role status..." -Level INFO
     $fsmoRows = Get-FSMORoleStatus -Domain $domain -Forest $forest
     
@@ -1132,7 +1112,6 @@ try {
     Write-Log "Calculating site statistics..." -Level INFO
     $siteStats = Get-SiteStatistics -DcRows $dcRows
     
-    # Collect events (if not skipped)
     $allEvents = @()
     $shutdownEvents = @()
     
@@ -1140,16 +1119,12 @@ try {
         $startTime = (Get-Date).AddHours(-$EventLookbackHours)
         Write-Log "Collecting events from last $EventLookbackHours hour(s)..." -Level INFO
         
-        # Collect unexpected shutdown events separately
         $shutdownEvents = Get-UnexpectedShutdownEvents -DomainControllers $allDcs -StartTime $startTime
-        
-        # Collect other events
         $allEvents = Collect-AllEvents -DomainControllers $allDcs -StartTime $startTime
     } else {
         Write-Log "Event collection skipped (SkipEventLogs = true)" -Level WARN
     }
     
-    # Calculate health status
     $reachableCount = @($dcRows | Where-Object { $_.Reachable -eq $true }).Count
     $unreachableCount = @($dcRows | Where-Object { $_.Reachable -eq $false }).Count
     $issueRows = @($dcRows | Where-Object { $_.DcStatus -ne 'Green' })
@@ -1166,14 +1141,12 @@ try {
         default  { '✅ All domain controllers and FSMO role holders are healthy. Continue daily monitoring.' }
     }
     
-    # Build scope description for display
     $scopeDescription = switch ($ScanScope) {
         'CurrentDomain' { "Current Domain: $($domain.DNSRoot)" }
         'CustomDCList' { "Custom DC List ($($allDcs.Count) DCs from file)" }
         default { "Full Forest: $($forest.Name) ($($allDcs.Count) DCs)" }
     }
     
-    # Build HTML fragments
     Write-Log "Building HTML report..." -Level INFO
     $siteCardsHtml = Build-SiteCardsHtml -SiteStats $siteStats
     $priorityHtml = Build-PriorityIssuesHtml -DcRows $dcRows
@@ -1185,7 +1158,6 @@ try {
     $shutdownStatsHtml = Build-ShutdownStatsCards -ShutdownEvents $shutdownEvents
     $shutdownEventsHtml = Build-ShutdownEventsHtml -ShutdownEvents $shutdownEvents
     
-    # Generate output paths
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
     $htmlPath = Join-Path $OutputDirectory "AD_Daily_Health_Summary_$stamp.html"
     $dcCsv = Join-Path $OutputDirectory "AD_Daily_Health_DCs_$stamp.csv"
@@ -1193,7 +1165,6 @@ try {
     $shutdownCsv = Join-Path $OutputDirectory "AD_Daily_Health_Shutdowns_$stamp.csv"
     $jsonPath = Join-Path $OutputDirectory "AD_Daily_Health_Summary_$stamp.json"
     
-    # Export CSV files
     Write-Log "Exporting CSV files..." -Level INFO
     $dcRows | Export-Csv -Path $dcCsv -NoTypeInformation -Encoding UTF8
     $allEvents | Export-Csv -Path $eventCsv -NoTypeInformation -Encoding UTF8
@@ -1202,7 +1173,6 @@ try {
     Write-Log "Exported Events CSV: $eventCsv" -Level OK
     Write-Log "Exported Shutdown Events CSV: $shutdownCsv" -Level OK
     
-    # Generate HTML content (simplified to avoid exceeding limits)
     $htmlContent = @"
 <!DOCTYPE html>
 <html lang='en'>
@@ -1269,7 +1239,7 @@ pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;overflow-x:a
 <div class='meta'>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</div>
 <div class='meta'>Domain: $(HtmlSafe $domain.DNSRoot) | Forest: $(HtmlSafe $forest.Name)</div>
 <div class='meta'>Scan Scope: $(HtmlSafe $scopeDescription) | DCs: $($dcRows.Count) | Sites: $($siteStats.Count)</div>
-<div class='meta'>Event Lookback: $EventLookbackHours hrs | Monitored Events: 4625,4719,4672,4648,1100,6008,1074</div>
+<div class='meta'>Event Lookback: $EventLookbackHours hrs</div>
 </div>
 
 <div class='cards'>
@@ -1295,11 +1265,11 @@ pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;overflow-x:a
 
 <div id='tab-overview' class='tab-content active'>
 <div class='panel'><h2>Site Health</h2><div class='site-grid'>$siteCardsHtml</div></div>
-<div class='panel'><h2>Priority Issues</h2><div class='table-wrapper'><table><thead><th>Site</th><th>DC</th><th>IP</th><th>Reachable</th><th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></thead><tbody>$priorityHtml</tbody></table></div></div>
+<div class='panel'><h2>Priority Issues</h2><div class='table-wrapper'></table><thead><th>Site</th><th>DC</th><th>IP</th><th>Reachable</th><th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></thead><tbody>$priorityHtml</tbody></table></div></div>
 </div>
 
 <div id='tab-sites' class='tab-content'>
-<div class='panel'><h2>All DCs by Site</h2><input class='search-bar' type='text' id='dcSearch' placeholder='Search...' oninput='filterDCs(this.value)'>$siteGroupHtml</div>
+<div class='panel'><h2>All DCs by Site</h2><input class='search-bar' type='text' id='dcSearch' placeholder='Search DC...' oninput='filterDCs(this.value)'>$siteGroupHtml</div>
 </div>
 
 <div id='tab-security' class='tab-content'>
@@ -1307,16 +1277,16 @@ pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;overflow-x:a
 </div>
 
 <div id='tab-shutdown' class='tab-content'>
-<div class='panel'><h2>Unexpected Shutdowns (6008)</h2>$shutdownStatsHtml<div class='table-wrapper'><table><thead><th>Time</th><th>Source DC</th><th>Event ID</th><th>Name</th><th>Severity</th><th>Message</th></thead><tbody>$shutdownEventsHtml</tbody></table></div><div class='meta'>Full list: $(Split-Path $shutdownCsv -Leaf)</div></div>
+<div class='panel'><h2>Unexpected Shutdowns (6008)</h2>$shutdownStatsHtml<div class='table-wrapper'><table><thead><th>Time</th><th>Source DC</th><th>ID</th><th>Name</th><th>Severity</th><th>Message</th></thead><tbody>$shutdownEventsHtml</tbody></table></div><div class='meta'>Full list: $(Split-Path $shutdownCsv -Leaf)</div></div>
 </div>
 
 <div id='tab-replication' class='tab-content'>
-<div class='panel'><h2>Replication Failures</h2><div class='table-wrapper'><table><thead><th>Server</th><th>Partner</th><th>Error</th><th>Count</th><th>First</th><th>Last</th></thead><tbody>$replFailHtml</tbody></table></div></div>
+<div class='panel'><h2>Replication Failures</h2><div class='table-wrapper'></table><thead><th>Server</th><th>Partner</th><th>Error</th><th>Count</th><th>First</th><th>Last</th></thead><tbody>$replFailHtml</tbody></table></div></div>
 <div class='panel'><h2>repadmin Summary</h2><pre>$(HtmlSafe $replText)</pre></div>
 </div>
 
 <div id='tab-fsmo' class='tab-content'>
-<div class='panel'><h2>FSMO Role Holders</h2><div class='table-wrapper'><table><thead><th>Role</th><th>Holder</th><th>Status</th></thead><tbody>$fsmoHtml</tbody></table></div></div>
+<div class='panel'><h2>FSMO Role Holders</h2><div class='table-wrapper'></tr><thead><th>Role</th><th>Holder</th><th>Status</th></thead><tbody>$fsmoHtml</tbody></table></div></div>
 </div>
 
 <div class='panel'><div class='meta' style='text-align:center'>
@@ -1324,28 +1294,34 @@ pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;overflow-x:a
 📄 HTML: $(Split-Path $htmlPath -Leaf)<br/>
 📊 DC: $(Split-Path $dcCsv -Leaf)<br/>
 📋 Events: $(Split-Path $eventCsv -Leaf)<br/>
-⚠️ Shutdowns: $(Split-Path $shutdownCsv -Leaf)<br/>
-📦 JSON: $(Split-Path $jsonPath -Leaf)
+⚠️ Shutdowns: $(Split-Path $shutdownCsv -Leaf)
 </div></div>
 
 <script>
 function showTab(tabName){
-    document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
-    document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(function(t){t.classList.remove('active');});
+    document.querySelectorAll('.tab-btn').forEach(function(b){b.classList.remove('active');});
     document.getElementById('tab-'+tabName).classList.add('active');
     event.target.classList.add('active');
 }
-function toggleSite(id){var el=document.getElementById('site-'+id);if(el){el.style.display=el.style.display==='none'?'':'none';}}
-function filterDCs(val){var lower=val.toLowerCase();document.querySelectorAll('.dc-row').forEach(r=>{var sd=r.getAttribute('data-search')||'';r.style.display=lower===''?'':(sd.indexOf(lower)>-1?'':'none');});}
+function toggleSite(id){
+    var el=document.getElementById('site-'+id);
+    if(el){el.style.display=el.style.display==='none'?'':'none';}
+}
+function filterDCs(val){
+    var lower=val.toLowerCase();
+    document.querySelectorAll('.dc-row').forEach(function(r){
+        var sd=r.getAttribute('data-search')||'';
+        r.style.display=lower===''?'':(sd.indexOf(lower)>-1?'':'none');
+    });
+}
 </script>
 </body>
 </html>
 "@
 
-    # Save HTML file
     [System.IO.File]::WriteAllText($htmlPath, $htmlContent, [System.Text.Encoding]::UTF8)
     
-    # Save JSON payload
     $jsonPayload = [pscustomobject]@{
         GeneratedOn = (Get-Date).ToString('s')
         ScanScope = $ScanScope
@@ -1371,10 +1347,6 @@ function filterDCs(val){var lower=val.toLowerCase();document.querySelectorAll('.
             TotalShutdowns = $shutdownEvents.Count
             AffectedDCs = ($shutdownEvents | Select-Object -Property SourceDC -Unique).Count
         }
-        SiteStats = @($siteStats)
-        DomainControllers = @($dcRows)
-        FsmoRoles = @($fsmoRows)
-        MonitoredEvents = @('4625', '4719', '4672', '4648', '1100', '1074', '6008')
     }
     
     $jsonPayload | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonPath -Encoding UTF8
@@ -1389,7 +1361,6 @@ function filterDCs(val){var lower=val.toLowerCase();document.querySelectorAll('.
     Write-Log "📦 JSON Report : $jsonPath" -Level OK
     Write-Log "═══════════════════════════════════════════════════════════════════════════════" -Level OK
     
-    # Return output object
     [pscustomobject]@{
         HtmlReport = $htmlPath
         DcCsv = $dcCsv
@@ -1402,11 +1373,13 @@ function filterDCs(val){var lower=val.toLowerCase();document.querySelectorAll('.
     }
 }
 catch {
-    Write-Log "FATAL ERROR: $($_.Exception.Message)" -Level ERROR
-    Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level ERROR
+    $errorMsg = $_.Exception.Message
+    $stackTrace = $_.ScriptStackTrace
+    Write-Log "FATAL ERROR: $errorMsg" -Level ERROR
+    Write-Log "Stack Trace: $stackTrace" -Level ERROR
     
     [pscustomobject]@{
-        Error = $_.Exception.Message
-        StackTrace = $_.ScriptStackTrace
+        Error = $errorMsg
+        StackTrace = $stackTrace
     }
 }
