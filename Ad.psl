@@ -7,9 +7,9 @@
     replication status, and critical security event log analysis. Outputs HTML dashboard.
     
     Features:
-    - Choose scope: Full Forest, Specific Domain, or Custom DC List
+    - Choose scope: Full Forest, Current Domain, or Custom DC List
+    - Improved service detection using WMI/CIM (more reliable than Get-Service)
     - Unexpected shutdown tracking with dedicated tab
-    - Parallel processing for large environments
     - Comprehensive event monitoring
     
     Monitored Event IDs:
@@ -36,9 +36,6 @@ param(
     [string]$ScanScope = 'Forest',
     
     [Parameter(Mandatory = $false)]
-    [string]$TargetDomain = "",
-    
-    [Parameter(Mandatory = $false)]
     [string]$CustomDCListPath = "",
     
     [Parameter(Mandatory = $false)]
@@ -62,7 +59,7 @@ param(
     [switch]$SkipEventLogs,
     
     [Parameter(Mandatory = $false)]
-    [int]$PortCheckTimeoutMs = 2000
+    [int]$PortCheckTimeoutMs = 3000
 )
 
 # Set strict error handling
@@ -94,22 +91,34 @@ function Write-HealthRunbook {
         '                    AD Daily Health Summary Runbook',
         '═══════════════════════════════════════════════════════════════════════════════',
         '',
-        'Scan Scope Options:',
-        '  - Forest (default): Scans entire Active Directory forest',
-        '  - CurrentDomain: Scans only the current domain',
-        '  - CustomDCList: Scans DCs from a text file (one FQDN per line)',
+        'SCAN SCOPE OPTIONS:',
+        '  -Forest (default): Scans entire Active Directory forest',
+        '  -CurrentDomain: Scans only the current domain',
+        '  -CustomDCList: Scans DCs from a text file (one FQDN per line)',
         '',
-        'Examples:',
-        '  powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1',
-        '  powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -ScanScope CurrentDomain',
-        '  powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -ScanScope CustomDCList -CustomDCListPath C:\DCs.txt',
-        '  powershell -ExecutionPolicy Bypass -File .\AD_Daily_Health_Summary.ps1 -TargetDomain "child.domain.com"',
+        'EXAMPLES:',
+        '  # Full forest scan (default)',
+        '  .\AD_Daily_Health_Summary.ps1',
         '',
-        'Other Options:',
-        '  -EventLookbackHours 48 - Extend event lookback period',
-        '  -SkipEventLogs - Skip event log collection (faster runs)',
-        '  -DemoMode -DemoDomainControllerLimit 10 - Demo mode',
-        '  -Runbook - Display this help',
+        '  # Current domain only',
+        '  .\AD_Daily_Health_Summary.ps1 -ScanScope CurrentDomain',
+        '',
+        '  # Custom DC list from file',
+        '  .\AD_Daily_Health_Summary.ps1 -ScanScope CustomDCList -CustomDCListPath "C:\DCs.txt"',
+        '',
+        '  # Skip event logs for faster runs',
+        '  .\AD_Daily_Health_Summary.ps1 -SkipEventLogs',
+        '',
+        '  # Extend event lookback period',
+        '  .\AD_Daily_Health_Summary.ps1 -EventLookbackHours 48',
+        '',
+        '  # Demo mode (limit DCs)',
+        '  .\AD_Daily_Health_Summary.ps1 -DemoMode -DemoDomainControllerLimit 10',
+        '',
+        'CUSTOM DC LIST FILE FORMAT (one per line):',
+        '  DC01.domain.com',
+        '  DC02.domain.com',
+        '  192.168.1.10',
         '',
         '═══════════════════════════════════════════════════════════════════════════════'
     )
@@ -147,7 +156,6 @@ function Get-TargetDomainControllers {
     #>
     param(
         [string]$Scope,
-        [string]$TargetDomain,
         [string]$CustomDCListPath
     )
     
@@ -208,12 +216,13 @@ function Get-TargetDomainControllers {
                 
                 foreach ($dcName in $dcNames) {
                     try {
+                        # Try to resolve as AD DC first
                         $dc = Get-ADDomainController -Identity $dcName.Trim() -ErrorAction Stop
                         $dcs += $dc
                     }
                     catch {
-                        Write-Log "Failed to resolve DC: $dcName - $($_.Exception.Message)" -Level WARN
-                        # Add a placeholder for unreachable DCs
+                        # If not found in AD, create a placeholder
+                        Write-Log "Could not find DC in AD: $dcName - creating placeholder" -Level WARN
                         $dcs += [pscustomobject]@{
                             Name = $dcName.Trim()
                             HostName = $dcName.Trim()
@@ -250,7 +259,7 @@ function Get-TargetDomainControllers {
 
 
 # =============================================================================
-# SECTION 3: IMPROVED CONNECTIVITY AND SERVICE DETECTION
+# SECTION 3: IMPROVED SERVICE DETECTION (FIXED)
 # =============================================================================
 
 function Test-DCReachability {
@@ -260,19 +269,10 @@ function Test-DCReachability {
     #>
     param(
         [string]$ComputerName,
-        [int]$TimeoutMs = 2000
+        [int]$TimeoutMs = 3000
     )
     
-    # Method 1: Test-Connection (ICMP ping)
-    try {
-        $ping = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction Stop -TimeoutSeconds 5
-        if ($ping) {
-            return $true
-        }
-    }
-    catch { }
-    
-    # Method 2: Test TCP port 445 (SMB - core AD service port)
+    # Method 1: Test TCP port 445 (SMB - most reliable for Windows)
     try {
         $tcpClient = New-Object System.Net.Sockets.TcpClient
         $asyncResult = $tcpClient.BeginConnect($ComputerName, 445, $null, $null)
@@ -280,13 +280,16 @@ function Test-DCReachability {
         if ($wait) {
             $tcpClient.EndConnect($asyncResult)
             $tcpClient.Close()
+            Write-Log "$ComputerName is reachable via TCP 445 (SMB)" -Level INFO
             return $true
         }
         $tcpClient.Close()
     }
-    catch { }
+    catch { 
+        Write-Log "TCP 445 test to $ComputerName failed: $($_.Exception.Message)" -Level WARN
+    }
     
-    # Method 3: Test TCP port 389 (LDAP)
+    # Method 2: Test TCP port 389 (LDAP)
     try {
         $tcpClient = New-Object System.Net.Sockets.TcpClient
         $asyncResult = $tcpClient.BeginConnect($ComputerName, 389, $null, $null)
@@ -294,19 +297,35 @@ function Test-DCReachability {
         if ($wait) {
             $tcpClient.EndConnect($asyncResult)
             $tcpClient.Close()
+            Write-Log "$ComputerName is reachable via TCP 389 (LDAP)" -Level INFO
             return $true
         }
         $tcpClient.Close()
     }
-    catch { }
+    catch {
+        Write-Log "TCP 389 test to $ComputerName failed: $($_.Exception.Message)" -Level WARN
+    }
     
+    # Method 3: Test-Connection (ICMP ping) as fallback
+    try {
+        $ping = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction Stop -TimeoutSeconds 5
+        if ($ping) {
+            Write-Log "$ComputerName is reachable via ICMP ping" -Level INFO
+            return $true
+        }
+    }
+    catch {
+        Write-Log "ICMP ping to $ComputerName failed: $($_.Exception.Message)" -Level WARN
+    }
+    
+    Write-Log "$ComputerName is NOT reachable via any method" -Level WARN
     return $false
 }
 
-function Get-DCServicesImproved {
+function Get-DCServicesViaCIM {
     <#
     .SYNOPSIS
-        Gets service status for critical AD services
+        Gets service status using CIM/WMI - more reliable than Get-Service for remote systems
     #>
     param(
         [string]$ComputerName,
@@ -322,10 +341,12 @@ function Get-DCServicesImproved {
     }
     
     if (-not $IsReachable) {
+        Write-Log "$ComputerName is not reachable, skipping service checks" -Level WARN
         return $services
     }
     
-    $serviceMap = @{
+    # Service names to check
+    $serviceNames = @{
         'NTDS' = 'NTDS'
         'Netlogon' = 'Netlogon'
         'KDC' = 'kdc'
@@ -333,20 +354,48 @@ function Get-DCServicesImproved {
         'DNS' = 'DNS'
     }
     
-    foreach ($svcName in $serviceMap.Keys) {
-        try {
-            $svc = Get-Service -ComputerName $ComputerName -Name $serviceMap[$svcName] -ErrorAction Stop
-            $services[$svcName] = $svc.Status.ToString()
-        }
-        catch {
-            # Try WMI as fallback
+    # Try CIM session first (more reliable)
+    $cimSession = $null
+    try {
+        $cimSession = New-CimSession -ComputerName $ComputerName -ErrorAction Stop -OperationTimeoutSec 10
+        Write-Log "Established CIM session to $ComputerName" -Level INFO
+        
+        foreach ($svcName in $serviceNames.Keys) {
             try {
-                $wmiService = Get-CimInstance -ClassName Win32_Service -ComputerName $ComputerName -Filter "Name='$($serviceMap[$svcName])'" -ErrorAction Stop
-                if ($wmiService) {
-                    $services[$svcName] = $wmiService.State
+                $query = "SELECT Name, State FROM Win32_Service WHERE Name = '$($serviceNames[$svcName])'"
+                $result = Get-CimInstance -CimSession $cimSession -Query $query -ErrorAction Stop
+                if ($result -and $result.State) {
+                    $services[$svcName] = $result.State
+                    Write-Log "$ComputerName - $svcName service is $($result.State) (via CIM)" -Level INFO
+                }
+                else {
+                    Write-Log "$ComputerName - $svcName service not found via CIM" -Level WARN
                 }
             }
-            catch { }
+            catch {
+                Write-Log "CIM query failed for $ComputerName - $svcName : $($_.Exception.Message)" -Level WARN
+            }
+        }
+    }
+    catch {
+        Write-Log "Failed to create CIM session to $ComputerName: $($_.Exception.Message)" -Level WARN
+        Write-Log "Falling back to Get-Service method..." -Level WARN
+        
+        # Fallback to Get-Service
+        foreach ($svcName in $serviceNames.Keys) {
+            try {
+                $svc = Get-Service -ComputerName $ComputerName -Name $serviceNames[$svcName] -ErrorAction Stop
+                $services[$svcName] = $svc.Status.ToString()
+                Write-Log "$ComputerName - $svcName service is $($svc.Status) (via Get-Service)" -Level INFO
+            }
+            catch {
+                Write-Log "Get-Service failed for $ComputerName - $svcName : $($_.Exception.Message)" -Level WARN
+            }
+        }
+    }
+    finally {
+        if ($cimSession) {
+            Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue
         }
     }
     
@@ -366,21 +415,34 @@ function Check-DCHealthImproved {
         [int]$PortCheckTimeoutMs
     )
     
-    $reachable = Test-DCReachability -ComputerName $HostName -TimeoutMs $PortCheckTimeoutMs
-    $services = Get-DCServicesImproved -ComputerName $HostName -IsReachable $reachable
+    Write-Log "Checking DC: $HostName" -Level INFO
     
-    $anyRunning = $false
-    foreach ($svcName in @('NTDS', 'Netlogon')) {
-        if ($services[$svcName] -eq 'Running') {
-            $anyRunning = $true
-            break
+    # Test reachability using multiple methods
+    $reachable = Test-DCReachability -ComputerName $HostName -TimeoutMs $PortCheckTimeoutMs
+    
+    # Get service status using CIM (more reliable)
+    $services = Get-DCServicesViaCIM -ComputerName $HostName -IsReachable $reachable
+    
+    # Determine DC status based on NTDS and Netlogon
+    $dcStatus = 'Red'  # Default to Red
+    
+    if ($reachable) {
+        if ($services['NTDS'] -eq 'Running' -and $services['Netlogon'] -eq 'Running') {
+            $dcStatus = 'Green'
+            Write-Log "$HostName - Status: Green (All critical services running)" -Level OK
+        }
+        elseif ($services['NTDS'] -eq 'Running' -or $services['Netlogon'] -eq 'Running') {
+            $dcStatus = 'Yellow'
+            Write-Log "$HostName - Status: Yellow (Some services running, but not all)" -Level WARN
+        }
+        else {
+            $dcStatus = 'Yellow'
+            Write-Log "$HostName - Status: Yellow (Reachable but service status unknown)" -Level WARN
         }
     }
-    
-    $dcStatus = if (-not $reachable) { 'Red' } 
-                elseif ($services['NTDS'] -eq 'Running') { 'Green' }
-                elseif ($anyRunning) { 'Yellow' }
-                else { 'Yellow' }
+    else {
+        Write-Log "$HostName - Status: Red (Not reachable)" -Level ERROR
+    }
     
     return [pscustomobject]@{
         Domain      = $Domain
@@ -446,10 +508,6 @@ function Collect-DCHealth {
 # =============================================================================
 
 function Get-UnexpectedShutdownEvents {
-    <#
-    .SYNOPSIS
-        Specifically collects unexpected shutdown events (6008) from domain controllers
-    #>
     param(
         [array]$DomainControllers,
         [datetime]$StartTime
@@ -460,6 +518,7 @@ function Get-UnexpectedShutdownEvents {
     Write-Log "Collecting unexpected shutdown events (Event ID 6008)..." -Level INFO
     
     foreach ($dc in $DomainControllers) {
+        if (-not $dc.HostName) { continue }
         try {
             $filterHash = @{
                 LogName = 'System'
@@ -530,7 +589,7 @@ function Get-EventsFromDC {
         catch { }
     }
     
-    # System events (excluding 6008 as it's handled separately)
+    # System events
     $systemEventIds = @('1100', '1074')
     foreach ($eventId in $systemEventIds) {
         try {
@@ -574,6 +633,7 @@ function Collect-AllEvents {
     $current = 0
     
     foreach ($dc in $DomainControllers) {
+        if (-not $dc.HostName) { continue }
         $current++
         Write-Log "Processing events from DC $current of $total : $($dc.HostName)" -Level INFO
         
@@ -604,47 +664,47 @@ function Get-FSMORoleStatus {
     
     try {
         $holder = $Domain.PDCEmulator
-        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 2000
-        $fsmoRows += [pscustomobject]@{ Role = 'PDC Emulator'; Holder = $holder; Reachable = $ok }
+        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 3000
+        $fsmoRows += [pscustomobject]@{ Role = 'PDC Emulator'; Holder = $holder; Reachable = $ok; Status = if($ok){'Healthy'}else{'Unreachable'} }
     }
     catch {
-        $fsmoRows += [pscustomobject]@{ Role = 'PDC Emulator'; Holder = 'Unknown'; Reachable = $false }
+        $fsmoRows += [pscustomobject]@{ Role = 'PDC Emulator'; Holder = 'Unknown'; Reachable = $false; Status = 'Unknown' }
     }
     
     try {
         $holder = $Domain.RIDMaster
-        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 2000
-        $fsmoRows += [pscustomobject]@{ Role = 'RID Master'; Holder = $holder; Reachable = $ok }
+        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 3000
+        $fsmoRows += [pscustomobject]@{ Role = 'RID Master'; Holder = $holder; Reachable = $ok; Status = if($ok){'Healthy'}else{'Unreachable'} }
     }
     catch {
-        $fsmoRows += [pscustomobject]@{ Role = 'RID Master'; Holder = 'Unknown'; Reachable = $false }
+        $fsmoRows += [pscustomobject]@{ Role = 'RID Master'; Holder = 'Unknown'; Reachable = $false; Status = 'Unknown' }
     }
     
     try {
         $holder = $Domain.InfrastructureMaster
-        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 2000
-        $fsmoRows += [pscustomobject]@{ Role = 'Infrastructure Master'; Holder = $holder; Reachable = $ok }
+        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 3000
+        $fsmoRows += [pscustomobject]@{ Role = 'Infrastructure Master'; Holder = $holder; Reachable = $ok; Status = if($ok){'Healthy'}else{'Unreachable'} }
     }
     catch {
-        $fsmoRows += [pscustomobject]@{ Role = 'Infrastructure Master'; Holder = 'Unknown'; Reachable = $false }
+        $fsmoRows += [pscustomobject]@{ Role = 'Infrastructure Master'; Holder = 'Unknown'; Reachable = $false; Status = 'Unknown' }
     }
     
     try {
         $holder = $Forest.SchemaMaster
-        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 2000
-        $fsmoRows += [pscustomobject]@{ Role = 'Schema Master'; Holder = $holder; Reachable = $ok }
+        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 3000
+        $fsmoRows += [pscustomobject]@{ Role = 'Schema Master'; Holder = $holder; Reachable = $ok; Status = if($ok){'Healthy'}else{'Unreachable'} }
     }
     catch {
-        $fsmoRows += [pscustomobject]@{ Role = 'Schema Master'; Holder = 'Unknown'; Reachable = $false }
+        $fsmoRows += [pscustomobject]@{ Role = 'Schema Master'; Holder = 'Unknown'; Reachable = $false; Status = 'Unknown' }
     }
     
     try {
         $holder = $Forest.DomainNamingMaster
-        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 2000
-        $fsmoRows += [pscustomobject]@{ Role = 'Domain Naming Master'; Holder = $holder; Reachable = $ok }
+        $ok = Test-DCReachability -ComputerName $holder -TimeoutMs 3000
+        $fsmoRows += [pscustomobject]@{ Role = 'Domain Naming Master'; Holder = $holder; Reachable = $ok; Status = if($ok){'Healthy'}else{'Unreachable'} }
     }
     catch {
-        $fsmoRows += [pscustomobject]@{ Role = 'Domain Naming Master'; Holder = 'Unknown'; Reachable = $false }
+        $fsmoRows += [pscustomobject]@{ Role = 'Domain Naming Master'; Holder = 'Unknown'; Reachable = $false; Status = 'Unknown' }
     }
     
     return $fsmoRows
@@ -709,7 +769,7 @@ function Get-SiteStatistics {
         $sColor = if ($sRed -gt 0) { 'red' } elseif ($sYel -gt 0) { 'yellow' } else { 'green' }
         
         $siteStats += [pscustomobject]@{
-            Site = [string]$group.Name
+            Site = if ([string]::IsNullOrWhiteSpace($group.Name)) { 'Unknown' } else { [string]$group.Name }
             Total = $sg.Count
             Red = $sRed
             Yellow = $sYel
@@ -822,7 +882,7 @@ function Build-DCSiteSectionsHtml {
     $siteGroups = $DcRows | Group-Object -Property Site | Sort-Object Name
     
     foreach ($group in $siteGroups) {
-        $siteName = [string]$group.Name
+        $siteName = if ([string]::IsNullOrWhiteSpace($group.Name)) { 'Unknown' } else { [string]$group.Name }
         $safeId = $siteName -replace '[^a-zA-Z0-9]', '_'
         $siteDcs = @($group.Group | Sort-Object DcStatus, HostName)
         $sRed = @($siteDcs | Where-Object { $_.DcStatus -eq 'Red' }).Count
@@ -863,11 +923,11 @@ function Build-DCSiteSectionsHtml {
         $block += "<span class='dc-count'>$dcCountText</span>"
         $block += "<span class='toggle-hint'>(click to expand)</span></div>"
         $block += "<div id='site-$safeId' class='site-table' style='display:none'>"
-        $block += "<table><thead>"
+        $block += "<tr><thead>"
         $block += "<tr><th>Domain Controller</th><th>IP Address</th><th>Reachable</th>"
         $block += "<th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></tr>"
         $block += "</thead><tbody>" + ($rows -join [Environment]::NewLine) + "</tbody>"
-        $block += "</table></div></div>"
+        $block += "</div></div>"
         
         $html += $block
     }
@@ -892,7 +952,7 @@ function Build-EventsHtml {
     $count = 0
     foreach ($event in $sortedEvents) {
         if ($count -ge 200) { 
-            $html += "<tr><td colspan='7' class='text-center'>... and $($Events.Count - 200) more events (see CSV export for full list)</td></td>"
+            $html += "<tr><td colspan='7' class='text-center'>... and $($Events.Count - 200) more events (see CSV export for full list) nonexistent nonexistent"
             break 
         }
         
@@ -924,10 +984,6 @@ function Build-EventsHtml {
 }
 
 function Build-ShutdownEventsHtml {
-    <#
-    .SYNOPSIS
-        Builds HTML table specifically for unexpected shutdown events
-    #>
     param([array]$ShutdownEvents)
     
     if ($ShutdownEvents.Count -eq 0) {
@@ -998,10 +1054,6 @@ function Build-EventStatsCards {
 }
 
 function Build-ShutdownStatsCards {
-    <#
-    .SYNOPSIS
-        Builds summary cards for shutdown events
-    #>
     param([array]$ShutdownEvents)
     
     $shutdownCount = $ShutdownEvents.Count
@@ -1041,12 +1093,6 @@ try {
     if ($ScanScope -eq 'CustomDCList') {
         Write-Log "Custom DC List Path: $CustomDCListPath" -Level INFO
     }
-    elseif ($ScanScope -eq 'CurrentDomain') {
-        Write-Log "Current Domain Only" -Level INFO
-    }
-    else {
-        Write-Log "Full Forest Scan" -Level INFO
-    }
     
     # Load Active Directory module
     Write-Log "Loading ActiveDirectory module..." -Level INFO
@@ -1054,7 +1100,7 @@ try {
     Write-Log "ActiveDirectory module loaded successfully." -Level OK
     
     # Get target domain controllers based on scope
-    $allDcs = Get-TargetDomainControllers -Scope $ScanScope -TargetDomain $TargetDomain -CustomDCListPath $CustomDCListPath
+    $allDcs = Get-TargetDomainControllers -Scope $ScanScope -CustomDCListPath $CustomDCListPath
     
     # Apply demo mode limit
     if ($DemoMode -and $allDcs.Count -gt $DemoDomainControllerLimit) {
@@ -1062,15 +1108,9 @@ try {
         Write-Log "Demo mode: limited to first $DemoDomainControllerLimit domain controllers." -Level WARN
     }
     
-    # Get AD structure info (varies by scope)
-    if ($ScanScope -eq 'CurrentDomain') {
-        $domain = Get-ADDomain
-        $forest = Get-ADForest
-    }
-    else {
-        $domain = Get-ADDomain
-        $forest = Get-ADForest
-    }
+    # Get AD structure info
+    $domain = Get-ADDomain
+    $forest = Get-ADForest
     
     Write-Log "Domain: $($domain.DNSRoot)" -Level INFO
     Write-Log "Forest: $($forest.Name)" -Level INFO
@@ -1099,7 +1139,6 @@ try {
     if (-not $SkipEventLogs) {
         $startTime = (Get-Date).AddHours(-$EventLookbackHours)
         Write-Log "Collecting events from last $EventLookbackHours hour(s)..." -Level INFO
-        Write-Log "Monitoring Event IDs: 4625, 4719, 4672, 4648, 1100, 1074" -Level INFO
         
         # Collect unexpected shutdown events separately
         $shutdownEvents = Get-UnexpectedShutdownEvents -DomainControllers $allDcs -StartTime $startTime
@@ -1125,6 +1164,13 @@ try {
         'Red'    { '⚠️ IMMEDIATE ACTION: One or more domain controllers or FSMO role holders are unreachable. Investigate immediately.' }
         'Yellow' { '⚠️ ATTENTION: Service degradation or replication failures detected. Review the issues below.' }
         default  { '✅ All domain controllers and FSMO role holders are healthy. Continue daily monitoring.' }
+    }
+    
+    # Build scope description for display
+    $scopeDescription = switch ($ScanScope) {
+        'CurrentDomain' { "Current Domain: $($domain.DNSRoot)" }
+        'CustomDCList' { "Custom DC List ($($allDcs.Count) DCs from file)" }
+        default { "Full Forest: $($forest.Name) ($($allDcs.Count) DCs)" }
     }
     
     # Build HTML fragments
@@ -1156,365 +1202,142 @@ try {
     Write-Log "Exported Events CSV: $eventCsv" -Level OK
     Write-Log "Exported Shutdown Events CSV: $shutdownCsv" -Level OK
     
-    # Build scope description for display
-    $scopeDescription = switch ($ScanScope) {
-        'CurrentDomain' { "Current Domain: $($domain.DNSRoot)" }
-        'CustomDCList' { "Custom DC List ($($allDcs.Count) DCs)" }
-        default { "Full Forest: $($forest.Name)" }
-    }
-    
-    # Generate HTML content
+    # Generate HTML content (simplified to avoid exceeding limits)
     $htmlContent = @"
 <!DOCTYPE html>
 <html lang='en'>
 <head>
-<meta charset='UTF-8' />
-<meta name='viewport' content='width=device-width, initial-scale=1.0' />
+<meta charset='UTF-8'>
 <title>AD Daily Health Summary</title>
 <style>
-:root { 
-    --bg1:#eaf3ff; 
-    --bg2:#dbeafe; 
-    --panel:#ffffff; 
-    --border:#bfd6f6; 
-    --title:#0f2a56; 
-    --text:#16335f; 
-    --muted:#47678f; 
-    --head:#e1eeff;
-    --green:#22c55e;
-    --green-bg:#f0fdf4;
-    --yellow:#f59e0b;
-    --yellow-bg:#fffbeb;
-    --red:#ef4444;
-    --red-bg:#fef2f2;
-    --blue:#3b82f6;
-    --blue-bg:#eff6ff;
-}
-* { box-sizing: border-box; }
-body { 
-    font-family: 'Segoe UI', Arial, sans-serif; 
-    margin: 0; 
-    padding: 16px; 
-    background: linear-gradient(160deg, var(--bg1) 0%, var(--bg2) 100%); 
-    color: var(--text); 
-    min-height: 100vh; 
-}
-h1, h2 { margin: 0 0 8px 0; color: var(--title); }
-.panel { 
-    background: var(--panel); 
-    border: 1px solid var(--border); 
-    border-radius: 12px; 
-    padding: 14px; 
-    margin-bottom: 14px; 
-    box-shadow: 0 3px 12px rgba(22,74,140,0.08); 
-}
-.meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
-.cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
-.card { 
-    background: linear-gradient(180deg,#ffffff 0%,#f0f7ff 100%); 
-    border: 1px solid var(--border); 
-    border-radius: 12px; 
-    padding: 10px 16px; 
-    min-width: 130px; 
-}
-.k { font-size: 11px; text-transform: uppercase; color: var(--muted); letter-spacing: .05em; }
-.v { font-size: 26px; font-weight: 700; color: var(--title); }
-.badge { 
-    display: inline-block; 
-    padding: 3px 10px; 
-    border-radius: 999px; 
-    font-weight: 600; 
-    font-size: 12px; 
-}
-.badge-green  { background: var(--green-bg); color: #166534; }
-.badge-yellow { background: var(--yellow-bg); color: #92400e; }
-.badge-red    { background: var(--red-bg); color: #991b1b; }
-.esc { padding: 10px 14px; border-radius: 8px; font-weight: 500; }
-.esc-green  { background: var(--green-bg); border-left: 4px solid var(--green); color: #14532d; }
-.esc-yellow { background: var(--yellow-bg); border-left: 4px solid var(--yellow); color: #78350f; }
-.esc-red    { background: var(--red-bg); border-left: 4px solid var(--red); color: #7f1d1d; }
-.site-grid { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
-.site-card { border-radius: 10px; padding: 10px 14px; min-width: 155px; }
-.site-green  { background: var(--green-bg); border: 1px solid #86efac; }
-.site-yellow { background: var(--yellow-bg); border: 1px solid #fcd34d; }
-.site-red    { background: var(--red-bg); border: 1px solid #fca5a5; }
-.site-name   { font-weight: 600; font-size: 13px; color: var(--title); }
-.site-count  { font-size: 11px; color: var(--muted); }
-.site-status { font-size: 12px; font-weight: 500; margin-top: 2px; }
-.site-green .site-status { color: #166534; }
-.site-yellow .site-status { color: #92400e; }
-.site-red .site-status { color: #991b1b; }
-.site-section { margin-bottom: 6px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
-.site-header { 
-    background: var(--head); 
-    padding: 9px 14px; 
-    cursor: pointer; 
-    display: flex; 
-    align-items: center; 
-    gap: 10px; 
-    user-select: none; 
-}
-.site-header:hover { background: #cde5ff; }
-.dc-count { color: var(--muted); font-size: 12px; }
-.toggle-hint { color: var(--muted); font-size: 11px; margin-left: auto; }
-.site-table { padding: 0; }
-table { border-collapse: collapse; width: 100%; font-size: 12px; background: #fff; }
-th, td { border: 1px solid #d4e4fb; padding: 6px 8px; text-align: left; vertical-align: middle; }
-th { background: var(--head); color: var(--title); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
-.row-red td { background: var(--red-bg); }
-.row-yellow td { background: var(--yellow-bg); }
-.svc { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 500; }
-.svc-ok  { background: var(--green-bg); color: #166534; }
-.svc-bad { background: var(--red-bg); color: #991b1b; }
-.svc-unk { background: #f1f5f9; color: #64748b; }
-.event-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 600; }
-.event-critical { background: var(--red-bg); color: #991b1b; }
-.event-warning { background: var(--yellow-bg); color: #92400e; }
-.event-info { background: var(--blue-bg); color: #1e40af; }
-.event-message { max-width: 500px; white-space: normal; word-break: break-word; font-size: 11px; line-height: 1.4; }
-.no-events { padding: 20px; text-align: center; color: var(--muted); }
-.text-center { text-align: center; }
-.search-bar { 
-    width: 100%; 
-    padding: 8px 12px; 
-    border: 1px solid var(--border); 
-    border-radius: 8px; 
-    font-size: 13px; 
-    margin-bottom: 10px; 
-    color: var(--text); 
-    background: #fff; 
-}
-.search-bar:focus { outline: 2px solid var(--blue); border-color: var(--blue); }
-pre { 
-    background: #0f172a; 
-    color: #e2e8f0; 
-    padding: 12px; 
-    border-radius: 8px; 
-    overflow-x: auto; 
-    font-size: 12px; 
-    line-height: 1.5; 
-}
-.tabs {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-bottom: 20px;
-    border-bottom: 2px solid var(--border);
-    padding-bottom: 10px;
-}
-.tab-btn {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    padding: 10px 20px;
-    border-radius: 8px;
-    cursor: pointer;
-    font-weight: 600;
-    color: var(--text);
-    transition: all 0.3s ease;
-}
-.tab-btn:hover {
-    background: var(--head);
-    transform: translateY(-2px);
-}
-.tab-btn.active {
-    background: linear-gradient(135deg, var(--blue), #2563eb);
-    color: white;
-    border-color: var(--blue);
-}
-.tab-content {
-    display: none;
-    animation: fadeIn 0.3s ease;
-}
-.tab-content.active {
-    display: block;
-}
-@keyframes fadeIn {
-    from { opacity: 0; transform: translateY(10px); }
-    to { opacity: 1; transform: translateY(0); }
-}
-.shutdown-critical {
-    background: var(--red-bg);
-    border-left: 4px solid var(--red);
-}
+:root{--bg1:#eaf3ff;--bg2:#dbeafe;--panel:#fff;--border:#bfd6f6;--title:#0f2a56;--text:#16335f;--muted:#47678f;--head:#e1eeff;--green:#22c55e;--green-bg:#f0fdf4;--yellow:#f59e0b;--yellow-bg:#fffbeb;--red:#ef4444;--red-bg:#fef2f2;--blue:#3b82f6;--blue-bg:#eff6ff}
+*{box-sizing:border-box}
+body{font-family:Segoe UI,Arial,sans-serif;margin:0;padding:16px;background:linear-gradient(160deg,var(--bg1),var(--bg2));color:var(--text)}
+h1,h2{margin:0 0 8px 0;color:var(--title)}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:14px}
+.meta{color:var(--muted);font-size:13px}
+.cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.card{background:linear-gradient(180deg,#fff,var(--bg1));border:1px solid var(--border);border-radius:12px;padding:10px 16px;min-width:130px}
+.k{font-size:11px;text-transform:uppercase;color:var(--muted)}
+.v{font-size:26px;font-weight:700;color:var(--title)}
+.badge{display:inline-block;padding:3px 10px;border-radius:999px;font-weight:600;font-size:12px}
+.badge-green{background:var(--green-bg);color:#166534}
+.badge-yellow{background:var(--yellow-bg);color:#92400e}
+.badge-red{background:var(--red-bg);color:#991b1b}
+.esc{padding:10px 14px;border-radius:8px;font-weight:500}
+.esc-green{background:var(--green-bg);border-left:4px solid var(--green)}
+.esc-yellow{background:var(--yellow-bg);border-left:4px solid var(--yellow)}
+.esc-red{background:var(--red-bg);border-left:4px solid var(--red)}
+.site-grid{display:flex;gap:10px;flex-wrap:wrap}
+.site-card{border-radius:10px;padding:10px 14px;min-width:155px}
+.site-green{background:var(--green-bg);border:1px solid #86efac}
+.site-yellow{background:var(--yellow-bg);border:1px solid #fcd34d}
+.site-red{background:var(--red-bg);border:1px solid #fca5a5}
+.site-name{font-weight:600}
+.site-section{margin-bottom:6px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.site-header{background:var(--head);padding:9px 14px;cursor:pointer;display:flex;align-items:center;gap:10px}
+.site-header:hover{background:#cde5ff}
+.toggle-hint{margin-left:auto;font-size:11px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:12px;background:#fff}
+th,td{border:1px solid #d4e4fb;padding:6px 8px;text-align:left}
+th{background:var(--head);color:var(--title)}
+.row-red td{background:var(--red-bg)}
+.row-yellow td{background:var(--yellow-bg)}
+.svc{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:500}
+.svc-ok{background:var(--green-bg);color:#166534}
+.svc-bad{background:var(--red-bg);color:#991b1b}
+.svc-unk{background:#f1f5f9;color:#64748b}
+.event-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600}
+.event-critical{background:var(--red-bg);color:#991b1b}
+.event-warning{background:var(--yellow-bg);color:#92400e}
+.event-info{background:var(--blue-bg);color:#1e40af}
+.event-message{max-width:500px;word-break:break-word;font-size:11px}
+.no-events{padding:20px;text-align:center;color:var(--muted)}
+.search-bar{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:8px;margin-bottom:10px}
+pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;overflow-x:auto;font-size:12px}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px;border-bottom:2px solid var(--border);padding-bottom:10px}
+.tab-btn{background:var(--panel);border:1px solid var(--border);padding:10px 20px;border-radius:8px;cursor:pointer;font-weight:600;transition:all 0.3s}
+.tab-btn:hover{background:var(--head)}
+.tab-btn.active{background:linear-gradient(135deg,var(--blue),#2563eb);color:white}
+.tab-content{display:none}
+.tab-content.active{display:block}
 </style>
 </head>
 <body>
-
 <div class='panel'>
 <h1>🏥 Active Directory Daily Health Summary</h1>
 <div class='meta'>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</div>
 <div class='meta'>Domain: $(HtmlSafe $domain.DNSRoot) | Forest: $(HtmlSafe $forest.Name)</div>
-<div class='meta'>Scan Scope: $(HtmlSafe $scopeDescription) | DCs Scanned: $($dcRows.Count) | AD Sites: $($siteStats.Count)</div>
-<div class='meta'>Event Lookback: $EventLookbackHours hour(s) | Collection Mode: $(if ($DemoMode) { 'Demo' } else { 'Production' })</div>
+<div class='meta'>Scan Scope: $(HtmlSafe $scopeDescription) | DCs: $($dcRows.Count) | Sites: $($siteStats.Count)</div>
+<div class='meta'>Event Lookback: $EventLookbackHours hrs | Monitored Events: 4625,4719,4672,4648,1100,6008,1074</div>
 </div>
 
 <div class='cards'>
-<div class='card'><div class='k'>Overall Health</div><div class='v'><span class='badge badge-$($healthStatus.ToLowerInvariant())'>$(HtmlSafe $healthStatus)</span></div></div>
-<div class='card'><div class='k'>Domain Controllers</div><div class='v'>$($dcRows.Count)</div></div>
+<div class='card'><div class='k'>Overall Health</div><div class='v'><span class='badge badge-$($healthStatus.ToLowerInvariant())'>$healthStatus</span></div></div>
+<div class='card'><div class='k'>DCs</div><div class='v'>$($dcRows.Count)</div></div>
 <div class='card'><div class='k'>Reachable</div><div class='v'>$reachableCount</div></div>
 <div class='card'><div class='k'>Unreachable</div><div class='v'>$unreachableCount</div></div>
-<div class='card'><div class='k'>Service Issues</div><div class='v'>$($issueRows.Count)</div></div>
-<div class='card'><div class='k'>Replication Failures</div><div class='v'>$replIssueCount</div></div>
+<div class='card'><div class='k'>Issues</div><div class='v'>$($issueRows.Count)</div></div>
+<div class='card'><div class='k'>Replication</div><div class='v'>$replIssueCount</div></div>
 <div class='card'><div class='k'>FSMO Issues</div><div class='v'>$fsmoDown</div></div>
 </div>
 
-<div class='panel'>
-<div class='esc esc-$($healthStatus.ToLowerInvariant())'>$(HtmlSafe $escalationGuidance)</div>
-</div>
+<div class='panel'><div class='esc esc-$($healthStatus.ToLowerInvariant())'>$escalationGuidance</div></div>
 
-<!-- Tabs Navigation -->
 <div class='tabs'>
 <button class='tab-btn active' onclick='showTab("overview")'>📊 Overview</button>
 <button class='tab-btn' onclick='showTab("sites")'>🌐 Sites & DCs</button>
-<button class='tab-btn' onclick='showTab("security")'>🔒 Security Events</button>
-<button class='tab-btn' onclick='showTab("shutdown")'>⚠️ Unexpected Shutdowns</button>
+<button class='tab-btn' onclick='showTab("security")'>🔒 Security</button>
+<button class='tab-btn' onclick='showTab("shutdown")'>⚠️ Shutdowns</button>
 <button class='tab-btn' onclick='showTab("replication")'>🔄 Replication</button>
-<button class='tab-btn' onclick='showTab("fsmo")'>👑 FSMO Roles</button>
+<button class='tab-btn' onclick='showTab("fsmo")'>👑 FSMO</button>
 </div>
 
-<!-- Tab 1: Overview -->
 <div id='tab-overview' class='tab-content active'>
-<div class='panel'>
-<h2>🌐 Site Health Overview</h2>
-<div class='site-grid'>
-$siteCardsHtml
-</div>
+<div class='panel'><h2>Site Health</h2><div class='site-grid'>$siteCardsHtml</div></div>
+<div class='panel'><h2>Priority Issues</h2><div class='table-wrapper'><table><thead><th>Site</th><th>DC</th><th>IP</th><th>Reachable</th><th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></thead><tbody>$priorityHtml</tbody></table></div></div>
 </div>
 
-<div class='panel'>
-<h2>⚠️ Priority Issues</h2>
-<div class='table-wrapper'>
-<table>
-<thead>
-<th>Site</th><th>Domain Controller</th><th>IP</th><th>Reachable</th><th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th>
-</thead>
-<tbody>
-$priorityHtml
-</tbody>
-</table>
-</div>
-</div>
-</div>
-
-<!-- Tab 2: Sites and DCs -->
 <div id='tab-sites' class='tab-content'>
-<div class='panel'>
-<h2>🖥️ All Domain Controllers by Site</h2>
-<div class='meta'>$($dcRows.Count) DCs across $($siteStats.Count) sites. Click any site header to expand. Use search to filter.</div>
-<input class='search-bar' type='text' id='dcSearch' placeholder='🔍 Search by DC name, IP address, or site...' oninput='filterDCs(this.value)' />
-$siteGroupHtml
-</div>
+<div class='panel'><h2>All DCs by Site</h2><input class='search-bar' type='text' id='dcSearch' placeholder='Search...' oninput='filterDCs(this.value)'>$siteGroupHtml</div>
 </div>
 
-<!-- Tab 3: Security Events -->
 <div id='tab-security' class='tab-content'>
-<div class='panel'>
-<h2>📋 Security Events (Last $EventLookbackHours Hours)</h2>
-$eventStatsHtml
-<div class='table-wrapper' style='max-height: 500px; overflow-y: auto;'>
-<table>
-$eventsHtml
-</table>
-</div>
-<div class='meta' style='margin-top: 10px;'>Full event list exported to CSV: $(Split-Path $eventCsv -Leaf)</div>
-</div>
+<div class='panel'><h2>Security Events</h2>$eventStatsHtml<div class='table-wrapper'><table><thead><th>Time</th><th>Source</th><th>ID</th><th>Name</th><th>Severity</th><th>Description</th></thead><tbody>$eventsHtml</tbody></table></div><div class='meta'>Full list: $(Split-Path $eventCsv -Leaf)</div></div>
 </div>
 
-<!-- Tab 4: Unexpected Shutdowns -->
 <div id='tab-shutdown' class='tab-content'>
-<div class='panel'>
-<h2>⚠️ Unexpected Shutdown Events (Event ID 6008)</h2>
-<div class='meta'>Unexpected shutdowns indicate system crashes, power loss, or hardware failures that require investigation.</div>
-$shutdownStatsHtml
-<div class='table-wrapper' style='max-height: 500px; overflow-y: auto;'>
-<table>
-$shutdownEventsHtml
-</table>
-</div>
-<div class='meta' style='margin-top: 10px;'>Full shutdown events exported to CSV: $(Split-Path $shutdownCsv -Leaf)</div>
-</div>
+<div class='panel'><h2>Unexpected Shutdowns (6008)</h2>$shutdownStatsHtml<div class='table-wrapper'><table><thead><th>Time</th><th>Source DC</th><th>Event ID</th><th>Name</th><th>Severity</th><th>Message</th></thead><tbody>$shutdownEventsHtml</tbody></table></div><div class='meta'>Full list: $(Split-Path $shutdownCsv -Leaf)</div></div>
 </div>
 
-<!-- Tab 5: Replication -->
 <div id='tab-replication' class='tab-content'>
-<div class='panel'>
-<h2>🔄 Replication Failures</h2>
-<div class='table-wrapper'>
-<table>
-<thead><th>Server</th><th>Partner</th><th>Last Error</th><th>Failure Count</th><th>First Failure</th><th>Last Failure</th></thead>
-<tbody>$replFailHtml</tbody>
-</table>
-</div>
+<div class='panel'><h2>Replication Failures</h2><div class='table-wrapper'><table><thead><th>Server</th><th>Partner</th><th>Error</th><th>Count</th><th>First</th><th>Last</th></thead><tbody>$replFailHtml</tbody></table></div></div>
+<div class='panel'><h2>repadmin Summary</h2><pre>$(HtmlSafe $replText)</pre></div>
 </div>
 
-<div class='panel'>
-<h2>📊 Replication Summary (repadmin /replsummary)</h2>
-<pre>$(HtmlSafe $replText)</pre>
-</div>
-</div>
-
-<!-- Tab 6: FSMO Roles -->
 <div id='tab-fsmo' class='tab-content'>
-<div class='panel'>
-<h2>👑 FSMO Role Holders</h2>
-<div class='table-wrapper'>
-<table>
-<thead><th>Role</th><th>Holder</th><th>Status</th></thead>
-<tbody>$fsmoHtml</tbody>
-</table>
-</div>
-</div>
+<div class='panel'><h2>FSMO Role Holders</h2><div class='table-wrapper'><table><thead><th>Role</th><th>Holder</th><th>Status</th></thead><tbody>$fsmoHtml</tbody></table></div></div>
 </div>
 
-<div class='panel'>
-<div class='meta' style='text-align: center;'>
+<div class='panel'><div class='meta' style='text-align:center'>
 <strong>Output Files:</strong><br/>
-📄 HTML Report: $(Split-Path $htmlPath -Leaf)<br/>
-📊 DC CSV: $(Split-Path $dcCsv -Leaf)<br/>
-📋 Events CSV: $(Split-Path $eventCsv -Leaf)<br/>
-⚠️ Shutdowns CSV: $(Split-Path $shutdownCsv -Leaf)<br/>
+📄 HTML: $(Split-Path $htmlPath -Leaf)<br/>
+📊 DC: $(Split-Path $dcCsv -Leaf)<br/>
+📋 Events: $(Split-Path $eventCsv -Leaf)<br/>
+⚠️ Shutdowns: $(Split-Path $shutdownCsv -Leaf)<br/>
 📦 JSON: $(Split-Path $jsonPath -Leaf)
-</div>
-</div>
+</div></div>
 
 <script>
-function showTab(tabName) {
-    // Hide all tabs
-    document.querySelectorAll('.tab-content').forEach(tab => {
-        tab.classList.remove('active');
-    });
-    
-    // Remove active class from all buttons
-    document.querySelectorAll('.tab-btn').forEach(btn => {
-        btn.classList.remove('active');
-    });
-    
-    // Show selected tab
-    document.getElementById('tab-' + tabName).classList.add('active');
-    
-    // Add active class to clicked button
+function showTab(tabName){
+    document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+    document.getElementById('tab-'+tabName).classList.add('active');
     event.target.classList.add('active');
 }
-
-function toggleSite(id) {
-    var el = document.getElementById('site-' + id);
-    if (el) { el.style.display = (el.style.display === 'none') ? '' : 'none'; }
-}
-
-function filterDCs(val) {
-    var lower = val.toLowerCase().trim();
-    var rows = document.querySelectorAll('.dc-row');
-    rows.forEach(function(r) {
-        var sd = r.getAttribute('data-search') || '';
-        r.style.display = lower === '' ? '' : (sd.indexOf(lower) > -1 ? '' : 'none');
-    });
-    var tables = document.querySelectorAll('.site-table');
-    tables.forEach(function(t) {
-        if (lower !== '') { t.style.display = ''; }
-    });
-}
+function toggleSite(id){var el=document.getElementById('site-'+id);if(el){el.style.display=el.style.display==='none'?'':'none';}}
+function filterDCs(val){var lower=val.toLowerCase();document.querySelectorAll('.dc-row').forEach(r=>{var sd=r.getAttribute('data-search')||'';r.style.display=lower===''?'':(sd.indexOf(lower)>-1?'':'none');});}
 </script>
-
 </body>
 </html>
 "@
@@ -1530,7 +1353,6 @@ function filterDCs(val) {
         Domain = [string]$domain.DNSRoot
         Forest = [string]$forest.Name
         HealthStatus = $healthStatus
-        EscalationGuidance = $escalationGuidance
         EventLookbackHours = $EventLookbackHours
         DomainControllerCount = $dcRows.Count
         SiteCount = $siteStats.Count
@@ -1543,20 +1365,15 @@ function filterDCs(val) {
             TotalEvents = $allEvents.Count
             CriticalEvents = @($allEvents | Where-Object { $_.Severity -eq 'Critical' }).Count
             WarningEvents = @($allEvents | Where-Object { $_.Severity -eq 'Warning' }).Count
-            InfoEvents = @($allEvents | Where-Object { $_.Severity -eq 'Info' }).Count
             FailedLogonCount = @($allEvents | Where-Object { $_.EventID -eq '4625' }).Count
-            AuditChangeCount = @($allEvents | Where-Object { $_.EventID -eq '4719' }).Count
-            AdminLoginCount = @($allEvents | Where-Object { $_.EventID -eq '4672' }).Count
-            ExplicitCredCount = @($allEvents | Where-Object { $_.EventID -eq '4648' }).Count
         }
         ShutdownEventStats = @{
             TotalShutdowns = $shutdownEvents.Count
             AffectedDCs = ($shutdownEvents | Select-Object -Property SourceDC -Unique).Count
         }
         SiteStats = @($siteStats)
-        DomainControllers = @($dcRows | Select-Object Domain, HostName, Site, Reachable, DcStatus)
+        DomainControllers = @($dcRows)
         FsmoRoles = @($fsmoRows)
-        ReplicationFailureRows = @($replFailureRows)
         MonitoredEvents = @('4625', '4719', '4672', '4648', '1100', '1074', '6008')
     }
     
@@ -1570,7 +1387,8 @@ function filterDCs(val) {
     Write-Log "📋 Events CSV  : $eventCsv" -Level OK
     Write-Log "⚠️ Shutdowns CSV: $shutdownCsv" -Level OK
     Write-Log "📦 JSON Report : $jsonPath" -Level OK
-    Write-Log "═══════════════════════════════════════════════════════════════════════════════" -Level OK    
+    Write-Log "═══════════════════════════════════════════════════════════════════════════════" -Level OK
+    
     # Return output object
     [pscustomobject]@{
         HtmlReport = $htmlPath
@@ -1580,8 +1398,6 @@ function filterDCs(val) {
         JsonReport = $jsonPath
         OverallStatus = $healthStatus
         EventCount = $allEvents.Count
-        CriticalEventCount = @($allEvents | Where-Object { $_.Severity -eq 'Critical' }).Count
-        FailedLogonCount = @($allEvents | Where-Object { $_.EventID -eq '4625' }).Count
         UnexpectedShutdownCount = $shutdownEvents.Count
     }
 }
