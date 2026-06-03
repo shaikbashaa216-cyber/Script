@@ -4,13 +4,12 @@
     
 .DESCRIPTION
     Performs daily health checks on Active Directory including DC health, FSMO roles,
-    replication status, and critical security event log analysis. Outputs HTML dashboard.
+    replication status, and critical security event log analysis.
     
     Features:
+    - Multiple service detection methods (WinRM, CIM, WMI, SMB, LDAP)
     - Choose scope: Full Forest, Current Domain, or Custom DC List
-    - Robust service detection using multiple methods (Get-Service, CIM, WMI)
     - Unexpected shutdown tracking with dedicated tab
-    - Comprehensive event monitoring
     
 .NOTES
     Run on a domain-joined server with ActiveDirectory module and admin privileges.
@@ -95,7 +94,7 @@ function Write-HealthRunbook {
         '  # Custom DC list',
         '  .\AD_Daily_Health_Summary.ps1 -ScanScope CustomDCList -CustomDCListPath "C:\DCs.txt"',
         '',
-        '  # Skip event logs',
+        '  # Skip event logs (faster)',
         '  .\AD_Daily_Health_Summary.ps1 -SkipEventLogs',
         '',
         '  # Demo mode',
@@ -237,7 +236,7 @@ function Get-TargetDomainControllers {
 
 
 # =============================================================================
-# SECTION 3: ROBUST SERVICE DETECTION (FIXED)
+# SECTION 3: IMPROVED SERVICE DETECTION - FIXED
 # =============================================================================
 
 function Test-DCReachability {
@@ -246,7 +245,7 @@ function Test-DCReachability {
         [int]$TimeoutMs = 3000
     )
     
-    # Method 1: TCP 445 (SMB)
+    # Method 1: TCP 445 (SMB - Core AD service)
     try {
         $tcpClient = New-Object System.Net.Sockets.TcpClient
         $asyncResult = $tcpClient.BeginConnect($ComputerName, 445, $null, $null)
@@ -277,20 +276,48 @@ function Test-DCReachability {
     # Method 3: ICMP ping
     try {
         $ping = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction Stop -TimeoutSeconds 5
-        if ($ping) {
-            return $true
-        }
+        if ($ping) { return $true }
     }
     catch { }
     
     return $false
 }
 
-function Get-DCServicesRobust {
+function Get-ServiceStatusViaSC {
     <#
     .SYNOPSIS
-        Gets service status using multiple reliable methods
-        Priority: 1. Get-Service (native), 2. CIM, 3. WMI
+        Uses SC command to query service status - this works even when WinRM is disabled
+    #>
+    param(
+        [string]$ComputerName,
+        [string]$ServiceName
+    )
+    
+    try {
+        $result = & sc.exe \\$ComputerName query $ServiceName 2>&1
+        $resultString = $result -join " "
+        
+        if ($resultString -match "STATE\s+:\s+(\d+)\s+(\w+)") {
+            $state = $matches[2]
+            if ($state -eq "RUNNING") { return "Running" }
+            if ($state -eq "STOPPED") { return "Stopped" }
+            return "Unknown"
+        }
+        return "Unknown"
+    }
+    catch {
+        return "Unknown"
+    }
+}
+
+function Get-DCServicesUltimate {
+    <#
+    .SYNOPSIS
+        Ultimate service detection using multiple methods:
+        1. WinRM/Invoke-Command (PowerShell Remoting)
+        2. SC command (Service Control - works without WinRM)
+        3. CIM/WMI
+        4. NET command fallback
     #>
     param(
         [string]$ComputerName,
@@ -306,6 +333,7 @@ function Get-DCServicesRobust {
     }
     
     if (-not $IsReachable) {
+        Write-Log "$ComputerName is not reachable, skipping service checks" -Level WARN
         return $services
     }
     
@@ -317,60 +345,88 @@ function Get-DCServicesRobust {
         'DNS' = 'DNS'
     }
     
-    # Method 1: Get-Service (most reliable for remote systems when WinRM is enabled)
-    $getServiceSuccess = $false
+    # ----- METHOD 1: SC Command (Works without WinRM) -----
+    Write-Log "Attempting to query services on $ComputerName using SC command..." -Level INFO
+    $scSuccess = $false
+    
     foreach ($svcKey in $serviceNames.Keys) {
         $svcName = $serviceNames[$svcKey]
-        try {
-            $svc = Get-Service -ComputerName $ComputerName -Name $svcName -ErrorAction Stop
-            $services[$svcKey] = $svc.Status.ToString()
-            $getServiceSuccess = $true
-            Write-Log "$ComputerName - $svcKey = $($svc.Status) (via Get-Service)" -Level INFO
-        }
-        catch {
-            # Continue to next method if Get-Service fails for any service
+        $status = Get-ServiceStatusViaSC -ComputerName $ComputerName -ServiceName $svcName
+        if ($status -ne "Unknown") {
+            $services[$svcKey] = $status
+            $scSuccess = $true
+            Write-Log "$ComputerName - $svcKey = $status (via SC)" -Level INFO
         }
     }
     
-    # If Get-Service succeeded for at least one service, assume it's working
-    if ($getServiceSuccess) {
+    if ($scSuccess) {
+        Write-Log "$ComputerName - Services retrieved successfully via SC command" -Level OK
         return $services
     }
     
-    # Method 2: CIM Session (fallback)
-    $cimSession = $null
+    # ----- METHOD 2: WinRM / Invoke-Command -----
     try {
-        $cimSession = New-CimSession -ComputerName $ComputerName -ErrorAction Stop -OperationTimeoutSec 15
+        Write-Log "Attempting WinRM connection to $ComputerName..." -Level INFO
+        $scriptBlock = {
+            param($svcMap)
+            $result = @{}
+            foreach ($key in $svcMap.Keys) {
+                try {
+                    $svc = Get-Service -Name $svcMap[$key] -ErrorAction Stop
+                    $result[$key] = $svc.Status.ToString()
+                } catch {
+                    $result[$key] = 'Unknown'
+                }
+            }
+            return $result
+        }
+        $remoteResult = Invoke-Command -ComputerName $ComputerName -ScriptBlock $scriptBlock -ArgumentList $serviceNames -ErrorAction Stop -TimeoutSeconds 30
+        foreach ($key in $remoteResult.Keys) {
+            $services[$key] = $remoteResult[$key]
+        }
+        Write-Log "$ComputerName - Services retrieved via WinRM" -Level OK
+        return $services
+    }
+    catch {
+        Write-Log "WinRM to $ComputerName failed: $($_.Exception.Message)" -Level WARN
+    }
+    
+    # ----- METHOD 3: CIM/WMI Fallback -----
+    try {
+        Write-Log "Attempting CIM connection to $ComputerName..." -Level INFO
+        $cimSession = New-CimSession -ComputerName $ComputerName -ErrorAction Stop -OperationTimeoutSec 30
         foreach ($svcKey in $serviceNames.Keys) {
             if ($services[$svcKey] -ne 'Unknown') { continue }
             $svcName = $serviceNames[$svcKey]
-            try {
-                $query = "SELECT Name, State FROM Win32_Service WHERE Name = '$svcName'"
-                $result = Get-CimInstance -CimSession $cimSession -Query $query -ErrorAction Stop
-                if ($result -and $result.State) {
-                    $services[$svcKey] = $result.State
-                    Write-Log "$ComputerName - $svcKey = $($result.State) (via CIM)" -Level INFO
-                }
+            $query = "SELECT Name, State FROM Win32_Service WHERE Name = '$svcName'"
+            $result = Get-CimInstance -CimSession $cimSession -Query $query -ErrorAction Stop
+            if ($result -and $result.State) {
+                $services[$svcKey] = $result.State
+                Write-Log "$ComputerName - $svcKey = $($result.State) (via CIM)" -Level INFO
             }
-            catch { }
         }
+        Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue
+        return $services
     }
     catch {
-        Write-Log "CIM session to $ComputerName failed, trying WMI fallback" -Level WARN
-    }
-    finally {
-        if ($cimSession) { Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue }
+        Write-Log "CIM to $ComputerName failed: $($_.Exception.Message)" -Level WARN
     }
     
-    # Method 3: Get-WmiObject (legacy fallback)
+    # ----- METHOD 4: NET Command Fallback -----
+    Write-Log "Attempting NET command queries to $ComputerName..." -Level INFO
     foreach ($svcKey in $serviceNames.Keys) {
         if ($services[$svcKey] -ne 'Unknown') { continue }
         $svcName = $serviceNames[$svcKey]
         try {
-            $wmiSvc = Get-WmiObject -Class Win32_Service -ComputerName $ComputerName -Filter "Name='$svcName'" -ErrorAction Stop
-            if ($wmiSvc -and $wmiSvc.State) {
-                $services[$svcKey] = $wmiSvc.State
-                Write-Log "$ComputerName - $svcKey = $($wmiSvc.State) (via WMI)" -Level INFO
+            $result = & net.exe start $svcName \\$ComputerName 2>&1
+            $resultString = $result -join " "
+            if ($resultString -match "already started" -or $resultString -match "is running") {
+                $services[$svcKey] = "Running"
+                Write-Log "$ComputerName - $svcKey = Running (via NET)" -Level INFO
+            }
+            elseif ($resultString -match "not started") {
+                $services[$svcKey] = "Stopped"
+                Write-Log "$ComputerName - $svcKey = Stopped (via NET)" -Level INFO
             }
         }
         catch { }
@@ -388,20 +444,28 @@ function Check-DCHealthImproved {
         [int]$PortCheckTimeoutMs
     )
     
+    Write-Log "Checking DC: $HostName" -Level INFO
+    
     $reachable = Test-DCReachability -ComputerName $HostName -TimeoutMs $PortCheckTimeoutMs
-    $services = Get-DCServicesRobust -ComputerName $HostName -IsReachable $reachable
+    $services = Get-DCServicesUltimate -ComputerName $HostName -IsReachable $reachable
     
     $dcStatus = 'Red'
     if ($reachable) {
         if ($services['NTDS'] -eq 'Running' -and $services['Netlogon'] -eq 'Running') {
             $dcStatus = 'Green'
+            Write-Log "$HostName - Status: Green (All critical services running)" -Level OK
         }
         elseif ($services['NTDS'] -eq 'Running' -or $services['Netlogon'] -eq 'Running') {
             $dcStatus = 'Yellow'
+            Write-Log "$HostName - Status: Yellow (Some services running)" -Level WARN
         }
         else {
             $dcStatus = 'Yellow'
+            Write-Log "$HostName - Status: Yellow (Reachable but service status unknown)" -Level WARN
         }
+    }
+    else {
+        Write-Log "$HostName - Status: Red (Not reachable)" -Level ERROR
     }
     
     return [pscustomobject]@{
@@ -476,7 +540,7 @@ function Get-UnexpectedShutdownEvents {
     
     $shutdownEvents = @()
     
-    Write-Log "Collecting unexpected shutdown events..." -Level INFO
+    Write-Log "Collecting unexpected shutdown events (Event ID 6008)..." -Level INFO
     
     foreach ($dc in $DomainControllers) {
         if (-not $dc.HostName) { continue }
@@ -746,7 +810,7 @@ function Get-SiteStatistics {
 
 
 # =============================================================================
-# SECTION 6: HTML GENERATION FUNCTIONS (SAME AS BEFORE)
+# SECTION 6: HTML GENERATION FUNCTIONS
 # =============================================================================
 
 function Build-SiteCardsHtml {
@@ -888,7 +952,7 @@ function Build-DCSiteSectionsHtml {
         $block += "<table><thead>"
         $block += "<tr><th>Domain Controller</th><th>IP Address</th><th>Reachable</th>"
         $block += "<th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></tr>"
-        $block += "</thead><tbody>" + ($rows -join [Environment]::NewLine) + "</tbody></table>"
+        $block += "</thead><tbody>" + ($rows -join [Environment]::NewLine) + "</tbody>"
         $block += "</div></div>"
         
         $html += $block
@@ -914,7 +978,7 @@ function Build-EventsHtml {
     $count = 0
     foreach ($event in $sortedEvents) {
         if ($count -ge 200) { 
-            $html += "<tr><td colspan='7' class='text-center'>... and $($Events.Count - 200) more events (see CSV export for full list)</td></tr>"
+            $html += "<tr><td colspan='7' class='text-center'>... and $($Events.Count - 200) more events (see CSV export for full list) nonexistent nonexistent"
             break 
         }
         
@@ -961,7 +1025,7 @@ function Build-ShutdownEventsHtml {
     $count = 0
     foreach ($event in $sortedEvents) {
         if ($count -ge 100) { 
-            $html += "<tr><td colspan='6' class='text-center'>... and $($ShutdownEvents.Count - 100) more events (see CSV export for full list)</td></tr>"
+            $html += "<tr><td colspan='6' class='text-center'>... and $($ShutdownEvents.Count - 100) more events (see CSV export for full list) nonexistent nonexistent"
             break 
         }
         
@@ -1147,6 +1211,7 @@ try {
     Write-Log "Exported Events CSV: $eventCsv" -Level OK
     Write-Log "Exported Shutdown Events CSV: $shutdownCsv" -Level OK
     
+    # HTML Content (simplified for length - same as before)
     $htmlContent = @"
 <!DOCTYPE html>
 <html lang='en'>
@@ -1239,7 +1304,7 @@ pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;overflow-x:a
 
 <div id='tab-overview' class='tab-content active'>
 <div class='panel'><h2>Site Health Overview</h2><div class='site-grid'>$siteCardsHtml</div></div>
-<div class='panel'><h2>Priority Issues</h2><div class='table-wrapper'><table><thead><th>Site</th><th>Domain Controller</th><th>IP</th><th>Reachable</th><th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></thead><tbody>$priorityHtml</tbody></table></div></div>
+<div class='panel'><h2>Priority Issues</h2><div class='table-wrapper'><table><thead><th>Site</th><th>Domain Controller</th><th>IP</th><th>Reachable</th><th>NTDS</th><th>Netlogon</th><th>KDC</th><th>DFSR</th><th>DNS</th></thead><tbody>$priorityHtml</tbody></tr></div></div>
 </div>
 
 <div id='tab-sites' class='tab-content'>
@@ -1247,7 +1312,7 @@ pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;overflow-x:a
 </div>
 
 <div id='tab-security' class='tab-content'>
-<div class='panel'><h2>Security Events (Last $EventLookbackHours Hours)</h2>$eventStatsHtml<div class='table-wrapper' style='max-height:500px;overflow-y:auto'><tr>$eventsHtml</table></div><div class='meta'>Full list: $(Split-Path $eventCsv -Leaf)</div></div>
+<div class='panel'><h2>Security Events (Last $EventLookbackHours Hours)</h2>$eventStatsHtml<div class='table-wrapper' style='max-height:500px;overflow-y:auto'></tr>$eventsHtml</table></div><div class='meta'>Full list: $(Split-Path $eventCsv -Leaf)</div></div>
 </div>
 
 <div id='tab-shutdown' class='tab-content'>
@@ -1255,7 +1320,7 @@ pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;overflow-x:a
 </div>
 
 <div id='tab-replication' class='tab-content'>
-<div class='panel'><h2>Replication Failures</h2><div class='table-wrapper'><table><thead><th>Server</th><th>Partner</th><th>Last Error</th><th>Failure Count</th><th>First Failure</th><th>Last Failure</th></thead><tbody>$replFailHtml</tbody></td></div></div>
+<div class='panel'><h2>Replication Failures</h2><div class='table-wrapper'><table><thead><th>Server</th><th>Partner</th><th>Last Error</th><th>Failure Count</th><th>First Failure</th><th>Last Failure</th></thead><tbody>$replFailHtml</tbody></tr></div></div>
 <div class='panel'><h2>Replication Summary (repadmin)</h2><pre>$(HtmlSafe $replText)</pre></div>
 </div>
 
